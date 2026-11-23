@@ -128,6 +128,21 @@ impl HlCache {
         !self.done()
     }
 
+    /// Highlights until the first `upto` lines are done or `budget` has
+    /// passed, whichever comes first.
+    pub fn advance_to(&mut self, hl: &Highlighter, doc: &TextDoc, upto: usize, budget: Duration) {
+        if self.plain {
+            return;
+        }
+        let start = Instant::now();
+        let theme_hl = ThemeHighlighter::new(&hl.theme);
+        let upto = upto.min(doc.lines.len());
+        while self.lines.len() < upto && start.elapsed() < budget {
+            let spans = self.highlight_line(hl, &theme_hl, &doc.lines[self.lines.len()]);
+            self.lines.push(spans);
+        }
+    }
+
     fn highlight_line(
         &mut self,
         hl: &Highlighter,
@@ -247,6 +262,21 @@ mod tests {
         assert_eq!(text, long);
         assert_eq!(c.line(0).unwrap()[0].style.fg, Some(crate::theme::TEXT));
         assert!(c.line(1).is_some());
+    }
+
+    #[test]
+    fn advance_to_stops_at_the_line_or_the_budget() {
+        let hl = Highlighter::new();
+        let d = doc("a.rs", &["let a = 1;"; 50]);
+        let mut c = HlCache::new(&hl, &d, false);
+        c.advance_to(&hl, &d, 20, Duration::from_secs(10));
+        assert!(c.line(19).is_some() && c.line(20).is_none());
+        // Past the end stops at the end; a zero budget does nothing.
+        let mut z = HlCache::new(&hl, &d, false);
+        z.advance_to(&hl, &d, 20, Duration::ZERO);
+        assert!(z.line(0).is_none());
+        c.advance_to(&hl, &d, 1000, Duration::from_secs(10));
+        assert!(c.done() && c.line(49).is_some());
     }
 
     #[test]

@@ -19,6 +19,9 @@ use crate::text_doc::TextDoc;
 use crate::view::{DocRows, text_width};
 use crate::wrap::{Rows, Scroll, clamp, scroll_bottom, scroll_down, scroll_up};
 
+/// The longest a load may block to color the lines on screen.
+const CATCH_UP: Duration = Duration::from_millis(100);
+
 /// The body area (without the header line).
 #[derive(Clone, Copy)]
 pub struct Viewport {
@@ -227,7 +230,7 @@ impl App {
             Some(s) if s.path == l.path => s.scroll,
             _ => Scroll::default(),
         });
-        let body = match l.content {
+        let mut body = match l.content {
             Content::Text { doc, plain } => {
                 let hl = HlCache::new(&self.hl, &doc, plain);
                 Body::Text { doc, hl }
@@ -238,6 +241,11 @@ impl App {
             Content::Missing => Body::Missing,
         };
         let scroll = move_scroll(&body, vp, start, Move::Clamp);
+        // Color what is on screen before the first draw; the rest follows in
+        // `tick_highlight`. Rows wrap, so lines on screen are at most `height`.
+        if let Body::Text { doc, hl } = &mut body {
+            hl.advance_to(&self.hl, doc, scroll.line + vp.height as usize, CATCH_UP);
+        }
         self.shown = Some(Shown {
             path: l.path,
             kind: l.kind,
@@ -585,6 +593,47 @@ mod tests {
         };
         assert!(a.on_loaded(text_loaded(&path, generation, 100), VP));
         assert_eq!(line(&a), 50);
+    }
+
+    #[test]
+    fn reload_colors_the_visible_lines_at_once() {
+        let (_d, f) = files(1);
+        let colored = |path: &Path, generation| {
+            let mut l = text_loaded(path, generation, 2000);
+            if let Content::Text { plain, .. } = &mut l.content {
+                *plain = false;
+            }
+            l
+        };
+        let visible = |a: &App| {
+            let Some(Shown {
+                body: Body::Text { hl, .. },
+                scroll,
+                ..
+            }) = a.shown()
+            else {
+                panic!("expected text");
+            };
+            (scroll.line..scroll.line + VP.height as usize).all(|i| hl.line(i).is_some())
+        };
+        let mut a = new_app();
+        let Action::Load { path, generation } = a.on_state_bytes(&state(Some("1"), &f[0])) else {
+            panic!("expected Load");
+        };
+        assert!(a.on_loaded(colored(&path, generation), VP));
+        for _ in 0..200 {
+            a.on_key(ctrl('d'), VP);
+        }
+        assert_eq!(line(&a), 1000);
+        let Action::Load { path, generation } = a.on_fs_change(&f[0]) else {
+            panic!("expected Load");
+        };
+        assert!(a.on_loaded(colored(&path, generation), VP));
+        assert_eq!(line(&a), 1000);
+        assert!(
+            visible(&a),
+            "visible lines are highlighted right after the reload"
+        );
     }
 
     #[test]

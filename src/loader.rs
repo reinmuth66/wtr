@@ -28,7 +28,7 @@ pub enum Content {
 }
 
 pub struct Loaded {
-    pub r#gen: u64,
+    pub generation: u64,
     pub path: PathBuf,
     pub kind: FileKind,
     pub content: Content,
@@ -40,7 +40,7 @@ pub fn spawn_load(path: PathBuf, generation: u64, tx: Sender<AppEvent>) {
     std::thread::spawn(move || {
         let (kind, content) = load(&path);
         let _ = tx.send(AppEvent::Loaded(Loaded {
-            r#gen: generation,
+            generation,
             path,
             kind,
             content,
@@ -263,7 +263,7 @@ mod tests {
         let AppEvent::Loaded(l) = rx.recv_timeout(Duration::from_secs(5)).unwrap() else {
             panic!()
         };
-        assert_eq!(l.r#gen, 7);
+        assert_eq!(l.generation, 7);
     }
 
     #[test]

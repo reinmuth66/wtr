@@ -347,6 +347,9 @@ impl Viewer {
                 if self.app.on_loaded(l, self.viewport()) {
                     self.rebuild_image();
                 }
+                // A symlink may now point elsewhere: let the next
+                // `sync_watch` read the links again.
+                self.watching.clear();
                 Ok(false)
             }
         }

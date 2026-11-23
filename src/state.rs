@@ -1,3 +1,4 @@
+use crate::watch::normalize;
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
 
@@ -37,7 +38,9 @@ pub fn resolve_target(file: Option<&Path>) -> Target {
         return Target::Show(path.to_path_buf());
     }
     match find_readme(path) {
-        Some(readme) => Target::Show(readme),
+        // The folder itself may be a symlink: normalize like any shown file,
+        // so file events (which carry real paths) match it.
+        Some(readme) => Target::Show(normalize(&readme)),
         None => Target::Keep,
     }
 }
@@ -93,13 +96,26 @@ mod tests {
         std::fs::write(d.path().join("Readme.Markdown"), "").unwrap();
         assert_eq!(
             resolve_target(Some(d.path())),
-            Target::Show(d.path().join("Readme.Markdown"))
+            Target::Show(normalize(&d.path().join("Readme.Markdown")))
         );
         std::fs::write(d.path().join("README.md"), "").unwrap();
         std::fs::write(d.path().join("readme.md"), "").unwrap();
         assert_eq!(
             resolve_target(Some(d.path())),
-            Target::Show(d.path().join("README.md"))
+            Target::Show(normalize(&d.path().join("README.md")))
+        );
+    }
+    #[test]
+    fn readme_of_a_symlinked_folder_is_its_real_path() {
+        let d = tempfile::tempdir().unwrap();
+        let real = d.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        std::fs::write(real.join("README.md"), "").unwrap();
+        let link = d.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        assert_eq!(
+            resolve_target(Some(&link)),
+            Target::Show(real.canonicalize().unwrap().join("README.md"))
         );
     }
     #[test]

@@ -14,6 +14,10 @@ use crate::theme;
 /// Files larger than this are shown without colors.
 pub const PLAIN_THRESHOLD: u64 = 4 * 1024 * 1024;
 
+/// Lines longer than this (in bytes) are not parsed, so one huge line cannot
+/// block the render loop.
+pub const MAX_HL_LINE: usize = 10_000;
+
 pub struct Highlighter {
     syntaxes: SyntaxSet,
     theme: Theme,
@@ -130,6 +134,9 @@ impl HlCache {
         theme_hl: &ThemeHighlighter,
         text: &str,
     ) -> Vec<Span<'static>> {
+        if text.len() > MAX_HL_LINE {
+            return plain_spans(text);
+        }
         let with_newline = format!("{text}\n");
         let Ok(ops) = self.parse.parse_line(&with_newline, &hl.syntaxes) else {
             // A parse failure leaves the state unusable for this line only.
@@ -220,6 +227,26 @@ mod tests {
         let mut c = HlCache::new(&hl, &d, false);
         assert!(c.advance(&hl, &d, Duration::ZERO));
         assert!(c.line(0).is_some() && c.line(1).is_none());
+    }
+
+    #[test]
+    fn very_long_line_is_not_parsed() {
+        let hl = Highlighter::new();
+        let long = format!("let s = \"{}\";", "a".repeat(1_000_000));
+        let d = doc("a.rs", &[&long, "let b = 2;"]);
+        let mut c = HlCache::new(&hl, &d, false);
+        let start = Instant::now();
+        c.advance(&hl, &d, Duration::from_secs(10));
+        assert!(start.elapsed() < Duration::from_secs(1));
+        let text: String = c
+            .line(0)
+            .unwrap()
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert_eq!(text, long);
+        assert_eq!(c.line(0).unwrap()[0].style.fg, Some(crate::theme::TEXT));
+        assert!(c.line(1).is_some());
     }
 
     #[test]

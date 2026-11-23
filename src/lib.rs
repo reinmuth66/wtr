@@ -7,3 +7,4 @@ pub mod kind;
 pub mod state;
 pub mod text_doc;
 pub mod theme;
+pub mod wrap;

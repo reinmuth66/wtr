@@ -10,4 +10,5 @@ pub mod state;
 pub mod text_doc;
 pub mod theme;
 pub mod view;
+pub mod watch;
 pub mod wrap;

@@ -1,5 +1,6 @@
 use std::fs::File;
 use std::io::Read;
+use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, OnceLock};
@@ -35,10 +36,12 @@ pub struct Loaded {
 }
 
 /// Loads `path` on a new thread and sends the result as `AppEvent::Loaded`.
-/// A closed receiver is ignored.
+/// A closed receiver is ignored. A panic while loading (a decoder failing on
+/// a hostile file) is sent as `Missing`, so the display never waits forever.
 pub fn spawn_load(path: PathBuf, generation: u64, tx: Sender<AppEvent>) {
     std::thread::spawn(move || {
-        let (kind, content) = load(&path);
+        let (kind, content) = std::panic::catch_unwind(AssertUnwindSafe(|| load(&path)))
+            .unwrap_or((FileKind::Other, Content::Missing));
         let _ = tx.send(AppEvent::Loaded(Loaded {
             generation,
             path,

@@ -118,6 +118,9 @@ pub struct App {
     tab: Option<String>,
     tabs: HashMap<Option<String>, TabState>,
     pending: Option<Pending>,
+    /// A file the state names that does not exist (yet), with its tab;
+    /// watched so that it shows up once created.
+    missing: Option<(PathBuf, Option<String>)>,
     generation: u64,
     message: Option<String>,
     /// The previous key was `g`.
@@ -133,6 +136,7 @@ impl App {
             tab: None,
             tabs: HashMap::new(),
             pending: None,
+            missing: None,
             generation: 0,
             message: None,
             g_pressed: false,
@@ -151,11 +155,14 @@ impl App {
         self.message = m;
     }
 
-    /// The file to watch: the one being loaded, else the one shown.
+    /// The file to watch: the one being loaded, else the one shown, else
+    /// the one named but missing.
     pub fn watched_file(&self) -> Option<&Path> {
-        match &self.pending {
-            Some(p) => Some(&p.path),
-            None => self.shown.as_ref().map(|s| s.path.as_path()),
+        match (&self.pending, &self.shown, &self.missing) {
+            (Some(p), _, _) => Some(&p.path),
+            (None, Some(s), _) => Some(&s.path),
+            (None, None, Some((m, _))) => Some(m),
+            (None, None, None) => None,
         }
     }
 
@@ -169,6 +176,7 @@ impl App {
 
     fn request_load(&mut self, path: PathBuf, tab: Option<String>, pos: Option<Scroll>) -> Action {
         self.generation += 1;
+        self.missing = None;
         self.pending = Some(Pending {
             path: path.clone(),
             tab,
@@ -191,6 +199,7 @@ impl App {
                 self.remember();
                 self.shown = None;
                 self.pending = None;
+                self.missing = state.file.map(|f| (f, self.tab.clone()));
                 // Drops a load that is still on its way.
                 self.generation += 1;
                 Action::None
@@ -206,16 +215,21 @@ impl App {
                     return Action::None;
                 }
                 self.remember();
-                let pos = self
-                    .tabs
-                    .get(&self.tab)
-                    .and_then(|t| t.scrolls.get(&p))
-                    .copied()
-                    .unwrap_or_default();
                 let tab = self.tab.clone();
-                self.request_load(p, tab, Some(pos))
+                self.load_in_tab(p, tab)
             }
         }
+    }
+
+    /// Loads `path` for `tab`, starting where that tab last left it.
+    fn load_in_tab(&mut self, path: PathBuf, tab: Option<String>) -> Action {
+        let pos = self
+            .tabs
+            .get(&tab)
+            .and_then(|t| t.scrolls.get(&path))
+            .copied()
+            .unwrap_or_default();
+        self.request_load(path, tab, Some(pos))
     }
 
     /// Returns true when the display changed.
@@ -267,10 +281,15 @@ impl App {
             let (path, tab, pos) = (p.path.clone(), p.tab.clone(), p.pos);
             return self.request_load(path, tab, pos);
         }
-        match &self.shown {
-            Some(s) if s.path == path => {
+        match (&self.shown, &self.missing) {
+            (Some(s), _) if s.path == path => {
                 let (path, tab) = (s.path.clone(), self.shown_tab.clone());
                 self.request_load(path, tab, None)
+            }
+            // The named file appeared: show it as the state asked.
+            (None, Some((m, tab))) if m == path => {
+                let (path, tab) = (m.clone(), tab.clone());
+                self.load_in_tab(path, tab)
             }
             _ => Action::None,
         }
@@ -671,7 +690,37 @@ mod tests {
         let bytes = serde_json::to_vec(&serde_json::json!({"file": "/no/such"})).unwrap();
         assert_eq!(a.on_state_bytes(&bytes), Action::None);
         assert!(a.shown().is_none());
+        // Still watched, so it shows up once it is created.
+        assert_eq!(a.watched_file(), Some(Path::new("/no/such")));
+        // A state without a file has nothing to watch.
+        assert_eq!(a.on_state_bytes(b"{}"), Action::None);
         assert!(a.watched_file().is_none());
+    }
+
+    #[test]
+    fn file_created_later_is_shown() {
+        let (d, f) = files(1);
+        let later = d.path().join("later.txt");
+        let mut a = new_app();
+        show(&mut a, Some("1"), &f[0], 100);
+        press(&mut a, &['j'; 7]);
+        show(&mut a, Some("2"), &f[0], 100);
+        // Tab 1 now points at a file that does not exist yet.
+        assert_eq!(a.on_state_bytes(&state(Some("1"), &later)), Action::None);
+        assert!(a.shown().is_none());
+        assert_eq!(a.watched_file(), Some(later.as_path()));
+        assert_eq!(a.on_fs_change(&f[0]), Action::None);
+        std::fs::write(&later, "x").unwrap();
+        let Action::Load { path, generation } = a.on_fs_change(&later) else {
+            panic!("expected Load");
+        };
+        assert_eq!(path, later);
+        assert!(a.on_loaded(text_loaded(&path, generation, 100), VP));
+        assert_eq!(a.shown().unwrap().path, later);
+        assert_eq!(line(&a), 0);
+        // It belongs to tab 1: going back to f1 there restores its position.
+        show(&mut a, Some("1"), &f[0], 100);
+        assert_eq!(line(&a), 7);
     }
 
     #[test]

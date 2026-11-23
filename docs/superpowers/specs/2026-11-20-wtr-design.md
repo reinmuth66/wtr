@@ -149,7 +149,7 @@
 - `isSidechain` が真の記録は飛ばす (子のエージェントの中の呼び出しは出さない。親の Agent の 1 行だけを出す)
 - assistant の記録の `tool_use` で道具の行を作り、user の記録の `tool_result` で同じ id の行に結果を付ける。結果が先に来ても結べるようにする
 - `toolUseResult` (物のときだけ) から、Edit の `structuredPatch` や、件数などの補足を取る
-- ユーザーの指示の行: ユーザーが打った文とスラッシュコマンドを、指示の行にする。道具の結果、system-reminder、ターミナルで実行したコマンドの記録、背景のエージェントの完了通知 (`task-notification`)、compact の要約 (`isCompactSummary` が真の user の記録) など、ユーザーが打っていないものは指示の行にしない。画像の添付は `[image]` と出す
+- ユーザーの指示の行: ユーザーが打った文とスラッシュコマンドを、指示の行にする。道具の結果、system-reminder、ターミナルで実行したコマンドの記録、背景のエージェントの完了通知 (`task-notification`)、サブエージェントの報告 (下の `agent-message`)、compact の要約 (`isCompactSummary` が真の user の記録) など、ユーザーが打っていないものは指示の行にしない。画像の添付は `[image]` と出す
 - エージェントの作業中にユーザーが打った指示は、user の記録にならず、`type` が `attachment` で `attachment.type` が `queued_command`、`attachment.commandMode` が `prompt` の記録にだけ残る (文は `attachment.prompt`)。これも指示の行にする。`commandMode` が `task-notification` のもの (背景のエージェントの完了通知) と、`commandMode` が無いもの (仕組みが入れた文) は指示の行にしない (2026-11-23 に実際の jsonl で確かめた)
 - スラッシュコマンドは 2 か所に残る。モデルに送るもの (`/effort`、`/clear`、skill など) は user の記録の中の `<command-name>`、`<command-args>` に、手元だけで動くもの (`/restart`、`/btw` など) は `type` が `system` で `subtype` が `local_command` の記録の `content` に、同じ形の印で残る。どちらも指示の行にする (2026-11-23 に実際の jsonl で確かめた)
 - `[Request interrupted by user]` と `[Request interrupted by user for tool use]` の文は、指示の行にしない (中断の印。下の状態の決め方に使う)
@@ -157,10 +157,17 @@
   - 失敗: `tool_result` の `is_error` が真
   - 拒否: `tool_result` の `is_error` が真で、中身が `The user doesn't want to proceed with this tool use.` で始まる (`toolUseResult` は文字列 `User rejected tool use`)
   - 中断: 拒否と同じ形の結果のあとに、`[Request interrupted by user for tool use]` の文の記録が続く。道具の途中で中断すると、待っていた道具には拒否と同じ結果が付くため、続く文で見分ける
-  - 実行中: まだ `tool_result` が無い
+  - 実行中: まだ `tool_result` が無い。背景で動かした Agent は、`toolUseResult.status` が `async_launched` で、まだ完了通知が来ていない間 (下の「背景のエージェント」)
 - hook の出力は、`type` が `attachment` で `attachment.type` が `hook_success`、`hook_non_blocking_error`、`hook_blocking_error` の記録にある (失敗の 2 つは小見出しを red にする) (`hookEvent`、`hookName`、`stdout`、`stderr`、`exitCode`、`toolUseID`)。`toolUseID` で道具の行に結ぶ。`PostToolUse` 以外 (`SessionStart`、`Stop`) は道具に結ばないので出さない
 - `isSidechain` が真の記録は、親の jsonl には無く、`subagents/` の下の別のファイルにある。飛ばす決まりは念のための守りとして残す
-- 行の種類は「道具の呼び出し」(tool_use の id が単位)、「指示」、「要約の区切り」の 3 つだけにする。サブエージェントからの報告 (`SubagentHandback`) は jsonl では普通の tool_use なので、道具の行になる。背景のエージェントの完了通知は新しい行にせず、元の Agent の行の結果は `tool_result` から取る (設計者の判断)
+- 行の種類は「道具の呼び出し」(tool_use の id が単位)、「指示」、「要約の区切り」の 3 つだけにする。サブエージェントの報告と背景のエージェントの完了通知は新しい行にせず、元の Agent の行に結ぶ (設計者の判断)
+- 背景のエージェント (2026-11-23 に実際の jsonl で確かめた):
+  - Agent を背景で動かすと、`tool_result` は起動した直後に返る。中身は `Async agent launched successfully...` で、`toolUseResult` は `status: "async_launched"` と `agentId` を持ち、道具の回数、トークン数、時間は持たない。この `tool_result` では成功にせず、実行中のままにする
+  - 終わると、`type` が `attachment` で `attachment.type` が `queued_command`、`commandMode` が `task-notification` の記録が来る。`attachment.prompt` の `<task-notification>` の中の `<tool-use-id>` で元の Agent の行に結び、`<status>` で状態を決める (`completed` は成功、それ以外は失敗)。`<usage>` の `subagent_tokens`、`tool_uses`、`duration_ms` で補足を作る。同じエージェントが続けて動くと、通知は何度も来る (最後のものを使う)。通知の `<summary>` が「自分の背景の仕事を待っている」ことを示す途中の通知でも、状態は `<status>` のとおりにする
+  - サブエージェントの報告は、親の jsonl では user の記録として届く。文は `Another Claude session sent a message:` で始まり、`<agent-message from="<agentId>">` と `[Subagent hand-back]` の印のあとに報告の全文が続く。`from` の値と Agent の `toolUseResult.agentId` で元の Agent の行に結び、展開の `─ result ─` に出す。報告が無ければ `─ result ─` には `tool_result` の中身を出す
+  - サブエージェントの中の `SubagentHandback` の呼び出しは、`subagents/agent-<agentId>.jsonl` にだけあり、親の jsonl には無い
+  - `[Subagent hand-back]` の印の無い `agent-message` (ほかのセッションからの知らせ) は、どの行にもしない
+  - 背景で動かさない Agent は、今までどおり `tool_result` と `toolUseResult` から結果と補足を取る
 - 要約の区切りの行: `type` が `system` で `subtype` が `compact_boundary` の記録で作る。`compactMetadata` から、手動か自動か (`trigger`) と前後のトークン数 (`preTokens`、`postTokens`) を取る。直後の `isCompactSummary` が真の user の記録の中身 (要約の全文) を、この行の中身にする
 - セッション (`session` の値) が変わったら、読み直す
 
@@ -181,7 +188,7 @@
 - 2 列目は種類のマーク: 指示 `nf-md-account`、Bash `nf-md-console`、Read `nf-md-eye`、Edit `nf-md-pencil`、Write `nf-md-file_plus`、Grep `nf-md-magnify`、Glob `nf-md-file_find`、WebSearch と WebFetch `nf-md-web`、AskUserQuestion `nf-md-help_circle`、Agent `nf-md-robot`、Skill `nf-md-book_open`、MCP の道具 `nf-md-puzzle`、それ以外は共通のマーク。マークは差し替えやすいよう 1 か所の表にまとめる
 - 要点 (道具ごと): Bash はコマンドの 1 行目、Read / Edit / Write はパス、Grep はパターンとパス、Glob はパターン、WebSearch は検索語、WebFetch は URL、AskUserQuestion は最初の質問の見出し、Agent は説明、Skill は skill の名前、ToolSearch は検索語、MCP の道具は `<サーバー> <道具>` と主な引数、SendMessage / TaskStop は相手と要約、それ以外は道具の名前
 - パスは、セッションの cwd からの相対パスにする。cwd の外は `~` で短くする
-- 補足 (右端に揃える): Bash は出力の行数 (`󰉻 12`)、Read は読んだ行数、Edit は `+12 -3`、Write は新規のマークと行数、Grep / Glob / ToolSearch は件数、WebSearch は回数と時間、WebFetch は HTTP の状態、AskUserQuestion は最初の質問で選ばれた答え、Artifact は URL、Agent は道具の使用回数とトークン数と時間 (`󱁤 36 · 113k · 3m 5s`)、失敗はエラーの 1 行目、拒否は `(rejected)`、中断は `(interrupted)`。Skill、MCP の道具などは空
+- 補足 (右端に揃える): Bash は出力の行数 (`󰉻 12`)、Read は読んだ行数、Edit は `+12 -3`、Write は新規のマークと行数、Grep / Glob / ToolSearch は件数、WebSearch は回数と時間、WebFetch は HTTP の状態、AskUserQuestion は最初の質問で選ばれた答え、Artifact は URL、Agent は道具の使用回数とトークン数と時間 (`󱁤 36 · 113k · 3m 5s`)、失敗はエラーの 1 行目、拒否は `(rejected)`、中断は `(interrupted)`、実行中は `(running)` (どの道具でも。背景のエージェントも含む)。Skill、MCP の道具などは空
 - 編集後の LSP の指摘: `type` が `attachment` で `attachment.type` が `diagnostics` の記録 (`files[].uri`、`files[].diagnostics[]` の `severity`、`message`、`range`) を、直前の同じパスの Edit / Write の行に結ぶ (記録に道具の id が無いため、パスで結ぶ。同じパスの行が無ければ出さない)。指摘があれば、その行の補足の先頭 (`+12 -3` や `new 40` の前) に件数を出す。Error を含めば `nf-md-close_circle` を red、Warning だけなら `nf-md-alert` を yellow で出す (例: `󰅚 2 +4 -1`。件数と行数の間は `+4` と `-1` の間と同じ空白 1 つで、`·` は入れない)。状態のマークは成功のまま変えない。展開では `─ diagnostics ─` の下に、指摘ごとに重さ、行番号、文を出す (2026-11-23 の判断)。`diagnostics` は「使う」に入れる
 - マークの残り (2026-11-23 の仮の決定。1 か所の表で差し替える):
   - 種類: それ以外の共通 `nf-md-tools`、ToolSearch `nf-md-toolbox`、SendMessage `nf-md-message_arrow_right`、TaskStop `nf-md-stop_circle`、Artifact `nf-md-application`

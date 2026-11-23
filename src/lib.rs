@@ -4,4 +4,5 @@ pub mod event;
 pub mod icons;
 pub mod kind;
 pub mod state;
+pub mod text_doc;
 pub mod theme;

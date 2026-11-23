@@ -59,16 +59,28 @@ impl FsWatch {
             let _ = self.debouncer.watcher().unwatch(&d);
             self.dirs.remove(&d);
         }
+        // One folder failing must not leave the others unwatched: keep going
+        // and return the first error at the end. Failed folders are not
+        // recorded, so a later call retries them.
+        let mut first_err = None;
         for d in want {
             if self.dirs.contains(&d) {
                 continue;
             }
-            self.debouncer
+            match self
+                .debouncer
                 .watcher()
-                .watch(&d, RecursiveMode::NonRecursive)?;
-            self.dirs.insert(d);
+                .watch(&d, RecursiveMode::NonRecursive)
+            {
+                Ok(()) => {
+                    self.dirs.insert(d);
+                }
+                Err(e) => {
+                    first_err.get_or_insert(e);
+                }
+            }
         }
-        Ok(())
+        first_err.map_or(Ok(()), Err)
     }
 }
 
@@ -155,6 +167,28 @@ mod tests {
         }
         std::fs::write(&b, "2").unwrap();
         assert!(wait_for(&rx, &normalize(&b)));
+    }
+
+    #[test]
+    fn a_failing_folder_does_not_stop_the_others() {
+        let d = tempfile::tempdir().unwrap();
+        let missing = d.path().join("missing").join("x");
+        let p = d.path().join("s.json");
+        std::fs::write(&p, "{}").unwrap();
+        let (tx, rx) = channel();
+        let mut w = FsWatch::new(tx).unwrap();
+        // Each fresh `want` set may be visited in a different (hash) order.
+        for files in [
+            [missing.as_path(), p.as_path()],
+            [p.as_path(), missing.as_path()],
+        ] {
+            w.set_files(&[]).unwrap();
+            assert!(w.set_files(&files).is_err());
+            assert_eq!(w.dirs.len(), 1, "only the existing folder is recorded");
+            std::thread::sleep(Duration::from_millis(200));
+            std::fs::write(&p, "2").unwrap();
+            assert!(wait_for(&rx, &normalize(&p)));
+        }
     }
 
     #[test]

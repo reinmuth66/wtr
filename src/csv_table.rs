@@ -48,9 +48,29 @@ pub fn read_table<R: std::io::Read>(
     Ok(Table { rows, truncated })
 }
 
+/// Makes a cell safe to measure and print: newlines become a mark, a tab one
+/// space, and other control characters caret notation (ESC -> `^[`).
 fn flatten(cell: &str) -> String {
-    cell.replace("\r\n", NEWLINE_MARK)
-        .replace(['\n', '\r'], NEWLINE_MARK)
+    let mut out = String::with_capacity(cell.len());
+    let mut chars = cell.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\r' => {
+                if chars.peek() == Some(&'\n') {
+                    chars.next();
+                }
+                out.push_str(NEWLINE_MARK);
+            }
+            '\n' => out.push_str(NEWLINE_MARK),
+            '\t' => out.push(' '),
+            '\0'..='\x1f' | '\x7f' => {
+                out.push('^');
+                out.push((c as u8 ^ 0x40) as char);
+            }
+            _ => out.push(c),
+        }
+    }
+    out
 }
 
 /// Cuts `s` to at most `max` columns, ending with an ellipsis when cut.
@@ -176,6 +196,26 @@ mod tests {
     #[test]
     fn newline_in_cell_is_marked() {
         assert!(text(&render_table(&read("\"1\n2\"\n", b','))[0]).contains("1↵2"));
+    }
+    #[test]
+    fn tab_and_control_chars_are_visible_and_aligned() {
+        let t = read("a\tb,x\n\"e\u{1b}[31mf\u{7f}\",y\nlong,z\n", b',');
+        let lines = render_table(&t);
+        let all: String = lines.iter().map(text).collect::<Vec<_>>().join("\n");
+        assert!(all.contains("a b"), "{all:?}");
+        assert!(all.contains("e^[[31mf^?"), "{all:?}");
+        assert!(!all.chars().any(|c| c.is_control() && c != '\n'), "{all:?}");
+        let col = |l: &Line| {
+            let s = text(l);
+            unicode_width::UnicodeWidthStr::width(&s[..s.find('│').unwrap()])
+        };
+        assert_eq!(col(&lines[0]), col(&lines[1]));
+        assert_eq!(col(&lines[1]), col(&lines[2]));
+    }
+    #[test]
+    fn crlf_and_lone_cr_are_one_mark() {
+        let t = read("\"1\r\n2\r3\"\n", b',');
+        assert!(text(&render_table(&t)[0]).contains("1↵2↵3"));
     }
     #[test]
     fn truncated_footer() {

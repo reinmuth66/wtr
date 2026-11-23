@@ -4,6 +4,7 @@ pub mod event;
 pub mod highlight;
 pub mod icons;
 pub mod kind;
+pub mod loader;
 pub mod state;
 pub mod text_doc;
 pub mod theme;

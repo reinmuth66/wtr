@@ -85,17 +85,21 @@ fn install_panic_hook() {
 /// input thread must not be polling.
 fn make_picker() -> Picker {
     let ghostty = std::env::var("TERM_PROGRAM").is_ok_and(|v| v == "ghostty");
-    let picker = match std::env::var("WTR_IMAGE_PROTOCOL").as_deref() {
+    match std::env::var("WTR_IMAGE_PROTOCOL").as_deref() {
         Ok("halfblocks") => Picker::halfblocks(),
         // The override wins even when the cell-size query failed.
         Ok("kitty") => kitty(cell_size_picker().unwrap_or_else(Picker::halfblocks)),
         _ if ghostty => cell_size_picker()
             .map(kitty)
             .unwrap_or_else(Picker::halfblocks),
-        _ => Picker::from_query_stdio().unwrap_or_else(|_| Picker::halfblocks()),
-    };
-    drain_input();
-    picker
+        _ => {
+            let picker = Picker::from_query_stdio().unwrap_or_else(|_| Picker::halfblocks());
+            // Only this full query can be answered late (Kitty, DA1); the
+            // cell-size query is answered at once and leaves nothing behind.
+            drain_input();
+            picker
+        }
+    }
 }
 
 /// Asks only for the cell size. The Kitty query is not sent: herdr answers it
@@ -255,6 +259,9 @@ struct Viewer {
     app: App,
     terminal: Term,
     picker: Picker,
+    /// The terminal may have changed (resize, pane shown again) since the
+    /// picker was made; ask again before the next image is built.
+    picker_stale: bool,
     image: Option<StatefulProtocol>,
     input: Input,
     tx: Sender<AppEvent>,
@@ -279,6 +286,7 @@ impl Viewer {
             app: App::new(Highlighter::new()),
             terminal,
             picker,
+            picker_stale: false,
             image: None,
             input,
             tx,
@@ -316,7 +324,7 @@ impl Viewer {
                 Err(RecvTimeoutError::Disconnected) => return Ok(()),
             }
             events.extend(rx.try_iter());
-            // Resize / focus events come in bursts: query the terminal once.
+            // Resize / focus events come in bursts: redraw once.
             let mut refresh = false;
             for ev in events {
                 if self.handle(ev, &mut refresh)? {
@@ -324,7 +332,10 @@ impl Viewer {
                 }
             }
             if refresh {
-                self.refresh_picker()?;
+                // Querying reads stdin, which can cost keys: ask only when an
+                // image needs the answer (at once if one is shown).
+                self.picker_stale = true;
+                self.redraw_all()?;
             }
             highlighting = self.app.tick_highlight(HL_BUDGET);
         }
@@ -409,14 +420,6 @@ impl Viewer {
         Ok(())
     }
 
-    /// The cell size is a stand-in while the pane is hidden; ask again.
-    fn refresh_picker(&mut self) -> io::Result<()> {
-        self.input.pause();
-        self.picker = make_picker();
-        self.input.resume();
-        self.redraw_all()
-    }
-
     /// Clears the screen and the previous frame, so the next draw sends every
     /// cell and the image again. `Terminal::clear` is not used: it asks the
     /// terminal for the cursor position, which can fail or time out.
@@ -427,7 +430,28 @@ impl Viewer {
         Ok(())
     }
 
+    /// The cell size is a stand-in while the pane is hidden; ask again when
+    /// it may have changed.
+    fn fresh_picker(&mut self) {
+        if !self.picker_stale {
+            return;
+        }
+        self.input.pause();
+        self.picker = make_picker();
+        self.input.resume();
+        self.picker_stale = false;
+    }
+
     fn rebuild_image(&mut self) {
+        if matches!(
+            self.app.shown(),
+            Some(Shown {
+                body: Body::Image(_),
+                ..
+            })
+        ) {
+            self.fresh_picker();
+        }
         self.image = match self.app.shown() {
             Some(Shown {
                 body: Body::Image(img),

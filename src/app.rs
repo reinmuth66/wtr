@@ -181,11 +181,7 @@ impl App {
         let Some(state) = parse_state(bytes) else {
             return Action::None;
         };
-        let tab_changed = state.tab != self.tab;
-        if tab_changed {
-            self.remember();
-            self.tab = state.tab;
-        }
+        self.tab = state.tab;
         match resolve_target(state.file.as_deref()) {
             Target::Keep => Action::None,
             Target::Missing => {
@@ -197,11 +193,13 @@ impl App {
                 Action::None
             }
             Target::Show(p) => {
-                let current = match &self.pending {
-                    Some(pending) => Some(pending.path.as_path()),
-                    None => self.shown.as_ref().map(|s| s.path.as_path()),
+                // The (tab, path) the display is, or is about to be, showing.
+                let current = match (&self.pending, &self.shown) {
+                    (Some(pending), _) => Some((&pending.tab, pending.path.as_path())),
+                    (None, Some(s)) => Some((&self.shown_tab, s.path.as_path())),
+                    (None, None) => None,
                 };
-                if !tab_changed && current == Some(p.as_path()) {
+                if current == Some((&self.tab, p.as_path())) {
                     return Action::None;
                 }
                 self.remember();
@@ -517,6 +515,31 @@ mod tests {
         assert_eq!(line(&a), 0);
         // Same tab, same file: nothing to load.
         assert_eq!(a.on_state_bytes(&state(Some("2"), &f[0])), Action::None);
+    }
+
+    #[test]
+    fn keep_on_tab_change_does_not_move_the_shown_file_to_the_new_tab() {
+        let (_d, f) = files(1);
+        let empty = tempfile::tempdir().unwrap();
+        let mut a = new_app();
+        show(&mut a, Some("1"), &f[0], 100);
+        press(&mut a, &['j'; 20]);
+        assert_eq!(line(&a), 20);
+        // A folder without README keeps f1 on screen, but the tab moves on.
+        assert_eq!(
+            a.on_state_bytes(&state(Some("2"), empty.path())),
+            Action::None
+        );
+        assert_eq!(a.shown().unwrap().path, f[0]);
+        // f1 from tab 2 is a new view: it loads and starts at the top.
+        show(&mut a, Some("2"), &f[0], 100);
+        assert_eq!(line(&a), 0);
+        press(&mut a, &['j'; 3]);
+        // Tab 1 still remembers its own position.
+        show(&mut a, Some("1"), &f[0], 100);
+        assert_eq!(line(&a), 20);
+        show(&mut a, Some("2"), &f[0], 100);
+        assert_eq!(line(&a), 3);
     }
 
     #[test]

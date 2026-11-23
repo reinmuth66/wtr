@@ -1,7 +1,502 @@
-fn main() {
-    let mode = match wtr::cli::parse_args(std::env::args_os()) {
+use std::io::{self, Stdout, stdout};
+use std::path::{Path, PathBuf};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
+use std::time::Duration;
+
+use ratatui::backend::{Backend, ClearType, CrosstermBackend};
+use ratatui::crossterm::event::{self, DisableFocusChange, EnableFocusChange, Event};
+use ratatui::crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
+use ratatui::crossterm::{cursor, execute};
+use ratatui::layout::{Constraint, Layout};
+use ratatui::widgets::Paragraph;
+use ratatui::{Frame, Terminal};
+use ratatui_image::StatefulImage;
+use ratatui_image::picker::cap_parser::QueryStdioOptions;
+use ratatui_image::picker::{Picker, ProtocolType};
+use ratatui_image::protocol::StatefulProtocol;
+
+use wtr::app::{Action, App, Body, Shown, Viewport};
+use wtr::cli::{Mode, parse_args};
+use wtr::event::AppEvent;
+use wtr::external::build_command;
+use wtr::highlight::Highlighter;
+use wtr::kind::FileKind;
+use wtr::loader::spawn_load;
+use wtr::view::{LinesView, TextView, header_line, info_lines, no_file_line};
+use wtr::watch::{FsWatch, normalize};
+
+type Term = Terminal<CrosstermBackend<Stdout>>;
+
+const INPUT_POLL: Duration = Duration::from_millis(20);
+/// Input is thrown away after a terminal query until this long passes quietly.
+const DRAIN_QUIET: Duration = Duration::from_millis(50);
+const IDLE_WAIT: Duration = Duration::from_millis(250);
+const HL_BUDGET: Duration = Duration::from_millis(8);
+
+fn main() -> anyhow::Result<()> {
+    let mode = match parse_args(std::env::args_os()) {
         Ok(mode) => mode,
         Err(e) => e.exit(),
     };
-    let _ = mode;
+    let (tx, rx) = mpsc::channel();
+    let watch = FsWatch::new(tx.clone())?;
+    install_panic_hook();
+    enter()?;
+    let result = Viewer::start(mode, watch, tx).and_then(|mut v| v.run(&rx));
+    leave()?;
+    Ok(result?)
+}
+
+fn enter() -> io::Result<()> {
+    terminal::enable_raw_mode()?;
+    execute!(
+        stdout(),
+        EnterAlternateScreen,
+        EnableFocusChange,
+        cursor::Hide
+    )
+}
+
+fn leave() -> io::Result<()> {
+    let screen = execute!(
+        stdout(),
+        cursor::Show,
+        DisableFocusChange,
+        LeaveAlternateScreen
+    );
+    terminal::disable_raw_mode()?;
+    screen
+}
+
+/// Only a panic on the main thread restores the terminal and is printed:
+/// the default message from another thread would land on the alternate screen.
+fn install_panic_hook() {
+    let original = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        if std::thread::current().name() == Some("main") {
+            let _ = leave();
+            original(info);
+        }
+    }));
+}
+
+/// Picks the image protocol and asks for the cell size. Reads stdin, so the
+/// input thread must not be polling.
+fn make_picker() -> Picker {
+    let ghostty = std::env::var("TERM_PROGRAM").is_ok_and(|v| v == "ghostty");
+    let picker = match std::env::var("WTR_IMAGE_PROTOCOL").as_deref() {
+        Ok("halfblocks") => Picker::halfblocks(),
+        // The override wins even when the cell-size query failed.
+        Ok("kitty") => kitty(cell_size_picker().unwrap_or_else(Picker::halfblocks)),
+        _ if ghostty => cell_size_picker()
+            .map(kitty)
+            .unwrap_or_else(Picker::halfblocks),
+        _ => Picker::from_query_stdio().unwrap_or_else(|_| Picker::halfblocks()),
+    };
+    drain_input();
+    picker
+}
+
+/// Asks only for the cell size. The Kitty query is not sent: herdr answers it
+/// late and the answer leaks into the input.
+fn cell_size_picker() -> Option<Picker> {
+    let options = QueryStdioOptions {
+        blacklist_protocols: vec![ProtocolType::Kitty, ProtocolType::Sixel],
+        ..Default::default()
+    };
+    Picker::from_query_stdio_with_options(options).ok()
+}
+
+fn kitty(mut picker: Picker) -> Picker {
+    picker.set_protocol_type(ProtocolType::Kitty);
+    picker
+}
+
+/// Late answers to a terminal query must not be read as keys.
+fn drain_input() {
+    while event::poll(DRAIN_QUIET).unwrap_or(false) {
+        if event::read().is_err() {
+            break;
+        }
+    }
+}
+
+#[derive(Default)]
+struct Gate {
+    paused: bool,
+    /// The input thread is outside `poll` and waiting.
+    idle: bool,
+}
+
+/// Reads terminal input on its own thread; can be paused while an external
+/// tool or a terminal query owns stdin.
+struct Input {
+    gate: Arc<(Mutex<Gate>, Condvar)>,
+}
+
+fn lock(m: &Mutex<Gate>) -> MutexGuard<'_, Gate> {
+    m.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+impl Input {
+    fn start(tx: Sender<AppEvent>) -> io::Result<Self> {
+        let gate = Arc::new((Mutex::new(Gate::default()), Condvar::new()));
+        let shared = gate.clone();
+        std::thread::Builder::new()
+            .name("input".into())
+            .spawn(move || input_loop(&shared, &tx))?;
+        Ok(Self { gate })
+    }
+
+    /// Returns once the thread has stopped outside `poll`.
+    fn pause(&self) {
+        let (m, cv) = &*self.gate;
+        let mut g = lock(m);
+        g.paused = true;
+        while !g.idle {
+            g = cv.wait(g).unwrap_or_else(PoisonError::into_inner);
+        }
+    }
+
+    fn resume(&self) {
+        let (m, cv) = &*self.gate;
+        lock(m).paused = false;
+        cv.notify_all();
+    }
+}
+
+fn input_loop(gate: &(Mutex<Gate>, Condvar), tx: &Sender<AppEvent>) {
+    let (m, cv) = gate;
+    loop {
+        {
+            let mut g = lock(m);
+            while g.paused {
+                g.idle = true;
+                cv.notify_all();
+                g = cv.wait(g).unwrap_or_else(PoisonError::into_inner);
+            }
+            g.idle = false;
+        }
+        let ev = match event::poll(INPUT_POLL) {
+            Ok(true) => event::read(),
+            Ok(false) => continue,
+            Err(e) => Err(e),
+        };
+        let Ok(ev) = ev else { break };
+        if tx.send(AppEvent::Input(ev)).is_err() {
+            break;
+        }
+    }
+    // A stopped thread must never keep `pause` waiting.
+    lock(m).idle = true;
+    cv.notify_all();
+}
+
+/// State-file bytes with `file` made absolute-normalized, so the paths the App
+/// holds match the ones file events arrive with. Bytes that do not parse are
+/// passed on unchanged (the App keeps the previous display for them).
+fn normalize_state(bytes: &[u8]) -> Vec<u8> {
+    let Ok(mut v) = serde_json::from_slice::<serde_json::Value>(bytes) else {
+        return bytes.to_vec();
+    };
+    if let Some(serde_json::Value::String(f)) = v.get_mut("file") {
+        *f = normalize(Path::new(f)).to_string_lossy().into_owned();
+    }
+    serde_json::to_vec(&v).unwrap_or_else(|_| bytes.to_vec())
+}
+
+/// The state-file bytes that show one fixed file.
+fn file_state(file: &Path) -> Vec<u8> {
+    serde_json::json!({ "file": file.to_string_lossy() })
+        .to_string()
+        .into_bytes()
+}
+
+/// A changed path worth any work: the state file or the watched file.
+fn is_relevant(p: &Path, state: Option<&Path>, watched: Option<&Path>) -> bool {
+    Some(p) == state || Some(p) == watched
+}
+
+fn render(f: &mut Frame, app: &App, image: &mut Option<StatefulProtocol>) {
+    let [head, body] =
+        Layout::vertical([Constraint::Length(1), Constraint::Fill(1)]).areas(f.area());
+    let shown = app.shown();
+    f.render_widget(
+        header_line(
+            shown.map(|s| s.path.as_path()),
+            shown.map(|s| s.kind),
+            app.message(),
+            head.width,
+        ),
+        head,
+    );
+    let Some(s) = shown else {
+        f.render_widget(no_file_line(), body);
+        return;
+    };
+    let scroll = s.scroll;
+    match &s.body {
+        Body::Text { doc, hl } => f.render_widget(TextView { doc, hl, scroll }, body),
+        Body::Table(lines) => f.render_widget(LinesView { lines, scroll }, body),
+        Body::Info { label, size } => {
+            f.render_widget(Paragraph::new(info_lines(label, *size)), body)
+        }
+        Body::Missing => f.render_widget(no_file_line(), body),
+        Body::Image(_) => {
+            if let Some(p) = image {
+                f.render_stateful_widget(StatefulImage::<StatefulProtocol>::default(), body, p);
+            }
+        }
+    }
+}
+
+struct Viewer {
+    app: App,
+    terminal: Term,
+    picker: Picker,
+    image: Option<StatefulProtocol>,
+    input: Input,
+    tx: Sender<AppEvent>,
+    /// The normalized state file (`None` when showing one fixed file).
+    state: Option<PathBuf>,
+    watch: FsWatch,
+    /// What `watch` was last set to successfully.
+    watching: Vec<PathBuf>,
+}
+
+impl Viewer {
+    /// Needs the terminal entered: the picker query comes before the input thread.
+    fn start(mode: Mode, watch: FsWatch, tx: Sender<AppEvent>) -> io::Result<Self> {
+        let terminal = Terminal::new(CrosstermBackend::new(stdout()))?;
+        let picker = make_picker();
+        let input = Input::start(tx.clone())?;
+        let (state, first) = match mode {
+            Mode::State(p) => {
+                let p = normalize(&p);
+                let bytes = normalize_state(&std::fs::read(&p).unwrap_or_default());
+                (Some(p), bytes)
+            }
+            Mode::File(f) => (None, file_state(&normalize(&f))),
+        };
+        let mut v = Self {
+            app: App::new(Highlighter::new()),
+            terminal,
+            picker,
+            image: None,
+            input,
+            tx,
+            state,
+            watch,
+            watching: Vec::new(),
+        };
+        let action = v.app.on_state_bytes(&first);
+        v.act(action)?;
+        Ok(v)
+    }
+
+    fn run(&mut self, rx: &Receiver<AppEvent>) -> io::Result<()> {
+        let mut highlighting = false;
+        loop {
+            self.sync_watch();
+            self.draw()?;
+            let wait = if highlighting {
+                Duration::ZERO
+            } else {
+                IDLE_WAIT
+            };
+            let mut events = Vec::new();
+            match rx.recv_timeout(wait) {
+                Ok(ev) => events.push(ev),
+                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => return Ok(()),
+            }
+            events.extend(rx.try_iter());
+            // Resize / focus events come in bursts: query the terminal once.
+            let mut refresh = false;
+            for ev in events {
+                if self.handle(ev, &mut refresh)? {
+                    return Ok(());
+                }
+            }
+            if refresh {
+                self.refresh_picker()?;
+            }
+            highlighting = self.app.tick_highlight(HL_BUDGET);
+        }
+    }
+
+    /// Returns true to quit.
+    fn handle(&mut self, ev: AppEvent, refresh: &mut bool) -> io::Result<bool> {
+        match ev {
+            AppEvent::Input(Event::Key(key)) => {
+                let action = self.app.on_key(key, self.viewport());
+                self.act(action)
+            }
+            AppEvent::Input(Event::Resize(..) | Event::FocusGained) => {
+                *refresh = true;
+                Ok(false)
+            }
+            AppEvent::Input(_) => Ok(false),
+            AppEvent::Fs(paths) => self.on_fs(paths),
+            AppEvent::Loaded(l) => {
+                if self.app.on_loaded(l, self.viewport()) {
+                    self.rebuild_image();
+                }
+                Ok(false)
+            }
+        }
+    }
+
+    fn on_fs(&mut self, mut paths: Vec<PathBuf>) -> io::Result<bool> {
+        let watched = self.app.watched_file().map(Path::to_path_buf);
+        paths.retain(|p| is_relevant(p, self.state.as_deref(), watched.as_deref()));
+        paths.sort();
+        paths.dedup();
+        if let Some(state) = &self.state
+            && paths.contains(state)
+            && let Ok(bytes) = std::fs::read(state)
+        {
+            let action = self.app.on_state_bytes(&normalize_state(&bytes));
+            if self.act(action)? {
+                return Ok(true);
+            }
+        }
+        for p in &paths {
+            let action = self.app.on_fs_change(p);
+            if self.act(action)? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Returns true to quit.
+    fn act(&mut self, action: Action) -> io::Result<bool> {
+        match action {
+            Action::None => {}
+            Action::Load { path, generation } => spawn_load(path, generation, self.tx.clone()),
+            Action::Open { path, kind, alt } => self.open_external(&path, kind, alt)?,
+            Action::Quit => return Ok(true),
+        }
+        Ok(false)
+    }
+
+    fn open_external(&mut self, path: &Path, kind: FileKind, alt: bool) -> io::Result<()> {
+        let mut cmd = match build_command(path, kind, alt, std::env::var_os("PATH").as_deref()) {
+            Ok(cmd) => cmd,
+            Err(m) => {
+                self.app.set_message(Some(m));
+                return Ok(());
+            }
+        };
+        self.input.pause();
+        leave()?;
+        let status = cmd.status();
+        enter()?;
+        self.input.resume();
+        self.redraw_all()?;
+        if let Err(e) = status {
+            self.app.set_message(Some(e.to_string()));
+        }
+        Ok(())
+    }
+
+    /// The cell size is a stand-in while the pane is hidden; ask again.
+    fn refresh_picker(&mut self) -> io::Result<()> {
+        self.input.pause();
+        self.picker = make_picker();
+        self.input.resume();
+        self.redraw_all()
+    }
+
+    /// Clears the screen and the previous frame, so the next draw sends every
+    /// cell and the image again. `Terminal::clear` is not used: it asks the
+    /// terminal for the cursor position, which can fail or time out.
+    fn redraw_all(&mut self) -> io::Result<()> {
+        self.terminal.backend_mut().clear_region(ClearType::All)?;
+        self.terminal.swap_buffers();
+        self.rebuild_image();
+        Ok(())
+    }
+
+    fn rebuild_image(&mut self) {
+        self.image = match self.app.shown() {
+            Some(Shown {
+                body: Body::Image(img),
+                ..
+            }) => Some(self.picker.new_resize_protocol(img.clone())),
+            _ => None,
+        };
+    }
+
+    /// Watches the state file and the watched file; a failure is retried on
+    /// the next turn and never stops the viewer.
+    fn sync_watch(&mut self) {
+        let want: Vec<PathBuf> = self
+            .state
+            .iter()
+            .cloned()
+            .chain(self.app.watched_file().map(Path::to_path_buf))
+            .collect();
+        if want == self.watching {
+            return;
+        }
+        let files: Vec<&Path> = want.iter().map(PathBuf::as_path).collect();
+        if self.watch.set_files(&files).is_ok() {
+            self.watching = want;
+        }
+    }
+
+    fn viewport(&self) -> Viewport {
+        let size = self.terminal.size().unwrap_or_default();
+        Viewport {
+            width: size.width,
+            height: size.height.saturating_sub(1),
+        }
+    }
+
+    fn draw(&mut self) -> io::Result<()> {
+        let (app, image) = (&self.app, &mut self.image);
+        self.terminal.draw(|f| render(f, app, image))?;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use wtr::state::parse_state;
+
+    #[test]
+    fn state_file_path_is_normalized_and_other_keys_kept() {
+        let d = tempfile::tempdir().unwrap();
+        let raw = d.path().join("a.txt");
+        let bytes = serde_json::json!({"tab": "1", "file": raw.to_str().unwrap()}).to_string();
+        let s = parse_state(&normalize_state(bytes.as_bytes())).unwrap();
+        assert_eq!(s.file, Some(normalize(&raw)));
+        assert_eq!(s.tab.as_deref(), Some("1"));
+    }
+
+    #[test]
+    fn broken_state_is_passed_on_unchanged() {
+        assert_eq!(normalize_state(br#"{"fi"#), br#"{"fi"#);
+        assert_eq!(normalize_state(b""), b"");
+    }
+
+    #[test]
+    fn file_state_names_the_file() {
+        let s = parse_state(&file_state(Path::new("/x/a b.txt"))).unwrap();
+        assert_eq!(s.file.as_deref(), Some(Path::new("/x/a b.txt")));
+    }
+
+    #[test]
+    fn only_state_and_watched_paths_are_relevant() {
+        let (s, w) = (Path::new("/s.json"), Path::new("/a.txt"));
+        assert!(is_relevant(s, Some(s), Some(w)));
+        assert!(is_relevant(w, Some(s), Some(w)));
+        assert!(is_relevant(w, None, Some(w)));
+        assert!(!is_relevant(Path::new("/tmp/other"), Some(s), Some(w)));
+        assert!(!is_relevant(Path::new("/tmp/other"), None, None));
+    }
 }

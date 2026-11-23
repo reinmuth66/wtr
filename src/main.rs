@@ -271,13 +271,9 @@ impl Viewer {
         let terminal = Terminal::new(CrosstermBackend::new(stdout()))?;
         let picker = make_picker();
         let input = Input::start(tx.clone())?;
-        let (state, first) = match mode {
-            Mode::State(p) => {
-                let p = normalize(&p);
-                let bytes = normalize_state(&std::fs::read(&p).unwrap_or_default());
-                (Some(p), bytes)
-            }
-            Mode::File(f) => (None, file_state(&normalize(&f))),
+        let (state, file) = match mode {
+            Mode::State(p) => (Some(normalize(&p)), None),
+            Mode::File(f) => (None, Some(normalize(&f))),
         };
         let mut v = Self {
             app: App::new(Highlighter::new()),
@@ -290,7 +286,15 @@ impl Viewer {
             watch,
             watching: Vec::new(),
         };
+        // Watch before every read, so a write in between is not missed: the
+        // state file before reading it, the shown file before loading it.
+        v.sync_watch();
+        let first = match (&v.state, file) {
+            (Some(p), _) => normalize_state(&std::fs::read(p).unwrap_or_default()),
+            (None, f) => f.map(|f| file_state(&f)).unwrap_or_default(),
+        };
         let action = v.app.on_state_bytes(&first);
+        v.sync_watch();
         v.act(action)?;
         Ok(v)
     }

@@ -17,7 +17,10 @@ struct Breaker {
 
 impl Breaker {
     fn new(width: usize) -> Self {
-        Self { width: width.max(1), used: 0 }
+        Self {
+            width: width.max(1),
+            used: 0,
+        }
     }
 
     /// Feeds one character; returns true when it starts a new row.
@@ -124,7 +127,11 @@ pub fn scroll_up(s: Scroll, n: usize, r: &impl Rows) -> Scroll {
     if len == 0 {
         return Scroll::default();
     }
-    let (mut line, mut row) = if s.line >= len { (len, 0) } else { (s.line, s.row) };
+    let (mut line, mut row) = if s.line >= len {
+        (len, 0)
+    } else {
+        (s.line, s.row)
+    };
     if n <= row {
         return Scroll { line, row: row - n };
     }
@@ -137,7 +144,10 @@ pub fn scroll_up(s: Scroll, n: usize, r: &impl Rows) -> Scroll {
         line -= 1;
         let rows = r.rows(line);
         if left <= rows {
-            return Scroll { line, row: rows - left };
+            return Scroll {
+                line,
+                row: rows - left,
+            };
         }
         left -= rows;
     }
@@ -156,7 +166,10 @@ pub fn scroll_bottom(r: &impl Rows, height: usize) -> Scroll {
     loop {
         let rows = r.rows(line);
         if rows >= remaining {
-            return Scroll { line, row: rows - remaining };
+            return Scroll {
+                line,
+                row: rows - remaining,
+            };
         }
         remaining -= rows;
         if line == 0 {
@@ -176,7 +189,10 @@ pub fn clamp(s: Scroll, r: &impl Rows, height: usize) -> Scroll {
     if s.line >= len {
         return bottom;
     }
-    let s = Scroll { line: s.line, row: s.row.min(r.rows(s.line) - 1) };
+    let s = Scroll {
+        line: s.line,
+        row: s.row.min(r.rows(s.line) - 1),
+    };
     if s.key() > bottom.key() { bottom } else { s }
 }
 
@@ -194,7 +210,10 @@ mod tests {
 
     #[test]
     fn ascii() {
-        assert_eq!(texts(&wrap_spans(&[Span::raw("abcdef")], 4)), ["abcd", "ef"]);
+        assert_eq!(
+            texts(&wrap_spans(&[Span::raw("abcdef")], 4)),
+            ["abcd", "ef"]
+        );
     }
 
     #[test]
@@ -223,7 +242,13 @@ mod tests {
 
     #[test]
     fn row_count_matches_wrap() {
-        for (t, w) in [("aあいうえおb", 3), ("", 2), ("abcdef", 4), ("あ", 1), ("e\u{301}e\u{301}e\u{301}", 2)] {
+        for (t, w) in [
+            ("aあいうえおb", 3),
+            ("", 2),
+            ("abcdef", 4),
+            ("あ", 1),
+            ("e\u{301}e\u{301}e\u{301}", 2),
+        ] {
             assert_eq!(row_count(t, w), wrap_spans(&[Span::raw(t)], w).len());
         }
     }
@@ -246,15 +271,27 @@ mod tests {
         assert_eq!(scroll_bottom(&r, 2), Scroll { line: 1, row: 2 });
         assert_eq!(scroll_bottom(&r, 10), s0);
         assert_eq!(scroll_up(Scroll { line: 1, row: 1 }, 2, &r), s0);
-        assert_eq!(scroll_up(Scroll { line: 2, row: 0 }, 1, &r), Scroll { line: 1, row: 2 });
+        assert_eq!(
+            scroll_up(Scroll { line: 2, row: 0 }, 1, &r),
+            Scroll { line: 1, row: 2 }
+        );
     }
 
     #[test]
     fn clamping() {
         let r = vec![1, 3, 1];
-        assert_eq!(clamp(Scroll { line: 9, row: 0 }, &r, 2), Scroll { line: 1, row: 2 });
-        assert_eq!(clamp(Scroll { line: 0, row: 7 }, &r, 2), Scroll { line: 0, row: 0 });
-        assert_eq!(clamp(Scroll { line: 3, row: 0 }, &Vec::<usize>::new(), 2), Scroll::default());
+        assert_eq!(
+            clamp(Scroll { line: 9, row: 0 }, &r, 2),
+            Scroll { line: 1, row: 2 }
+        );
+        assert_eq!(
+            clamp(Scroll { line: 0, row: 7 }, &r, 2),
+            Scroll { line: 0, row: 0 }
+        );
+        assert_eq!(
+            clamp(Scroll { line: 3, row: 0 }, &Vec::<usize>::new(), 2),
+            Scroll::default()
+        );
     }
 
     #[test]

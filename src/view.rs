@@ -211,8 +211,28 @@ pub fn header_line(
     ])
 }
 
+/// `message` alone, at the right end of a full row of `width` columns (the
+/// row is filled so it covers what is drawn below it).
+pub fn message_line(message: &str, width: u16) -> Line<'static> {
+    let width = width as usize;
+    let right = truncate_to(&format!("{} {message}", icons::ALERT), width);
+    let gap = width - right.width();
+    Line::from(vec![
+        Span::raw(" ".repeat(gap)),
+        Span::styled(right, Style::default().fg(theme::YELLOW)),
+    ])
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn message_line_fills_the_row() {
+        let s = text_of(&message_line("fx not found", 30));
+        assert!(s.ends_with("fx not found") && s.width() == 30);
+        assert!(!s.contains(icons::FILE_OTHER));
+        assert!(text_of(&message_line("nvim not found", 5)).width() <= 5);
+    }
+
     use super::*;
     use crate::highlight::Highlighter;
     use crate::text_doc::SyntaxHint;

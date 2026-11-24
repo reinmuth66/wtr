@@ -23,7 +23,9 @@ use wtr::external::build_command;
 use wtr::highlight::Highlighter;
 use wtr::kind::FileKind;
 use wtr::loader::spawn_load;
-use wtr::view::{LinesView, TextView, header_line, info_lines, no_file_line};
+// `header_line` is not used while the header line is off (issue #1).
+// use wtr::view::header_line;
+use wtr::view::{LinesView, TextView, info_lines, message_line, no_file_line};
 use wtr::watch::{FsWatch, normalize};
 
 type Term = Terminal<CrosstermBackend<Stdout>>;
@@ -223,18 +225,36 @@ fn is_relevant(p: &Path, state: Option<&Path>, watched: Option<&Path>) -> bool {
 }
 
 fn render(f: &mut Frame, app: &App, image: &mut Option<StatefulProtocol>) {
-    let [head, body] =
-        Layout::vertical([Constraint::Length(1), Constraint::Fill(1)]).areas(f.area());
+    // The header line (kind mark and file name) is not drawn: wtr only shows
+    // the preview (issue #1). It may come back depending on the tree's design.
+    // let [head, body] =
+    //     Layout::vertical([Constraint::Length(1), Constraint::Fill(1)]).areas(f.area());
+    // f.render_widget(
+    //     header_line(
+    //         shown.map(|s| s.path.as_path()),
+    //         shown.map(|s| s.kind),
+    //         app.message(),
+    //         head.width,
+    //     ),
+    //     head,
+    // );
+    let body = f.area();
+    render_body(f, app, image, body);
+    // A message (e.g. `fx not found`) goes over the first row until the next key.
+    if let Some(m) = app.message() {
+        let [head, _] =
+            Layout::vertical([Constraint::Length(1), Constraint::Fill(1)]).areas(body);
+        f.render_widget(message_line(m, head.width), head);
+    }
+}
+
+fn render_body(
+    f: &mut Frame,
+    app: &App,
+    image: &mut Option<StatefulProtocol>,
+    body: ratatui::layout::Rect,
+) {
     let shown = app.shown();
-    f.render_widget(
-        header_line(
-            shown.map(|s| s.path.as_path()),
-            shown.map(|s| s.kind),
-            app.message(),
-            head.width,
-        ),
-        head,
-    );
     let Some(s) = shown else {
         f.render_widget(no_file_line(), body);
         return;
@@ -483,7 +503,9 @@ impl Viewer {
         let size = self.terminal.size().unwrap_or_default();
         Viewport {
             width: size.width,
-            height: size.height.saturating_sub(1),
+            // No header line (issue #1); with it, this was `height - 1`.
+            // height: size.height.saturating_sub(1),
+            height: size.height,
         }
     }
 

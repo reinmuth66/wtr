@@ -22,7 +22,7 @@ use crate::wrap::{Rows, Scroll, clamp, scroll_bottom, scroll_down, scroll_up};
 /// The longest a load may block to color the lines on screen.
 const CATCH_UP: Duration = Duration::from_millis(100);
 
-/// The body area (without the header line).
+/// The body area (the whole pane; there is no header line, issue #1).
 #[derive(Clone, Copy)]
 pub struct Viewport {
     pub width: u16,

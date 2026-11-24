@@ -5,7 +5,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use image::DynamicImage;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -21,6 +21,9 @@ use crate::wrap::{Rows, Scroll, clamp, scroll_bottom, scroll_down, scroll_up};
 
 /// The longest a load may block to color the lines on screen.
 const CATCH_UP: Duration = Duration::from_millis(100);
+
+/// How long a message stays when no key is pressed.
+pub const MESSAGE_TTL: Duration = Duration::from_secs(3);
 
 /// The body area (the whole pane; there is no header line, issue #1).
 #[derive(Clone, Copy)]
@@ -122,7 +125,8 @@ pub struct App {
     /// watched so that it shows up once created.
     missing: Option<(PathBuf, Option<String>)>,
     generation: u64,
-    message: Option<String>,
+    /// A message and when it was set.
+    message: Option<(String, Instant)>,
     /// The previous key was `g`.
     g_pressed: bool,
 }
@@ -148,11 +152,21 @@ impl App {
     }
 
     pub fn message(&self) -> Option<&str> {
-        self.message.as_deref()
+        self.message.as_ref().map(|(m, _)| m.as_str())
     }
 
     pub fn set_message(&mut self, m: Option<String>) {
-        self.message = m;
+        self.message = m.map(|m| (m, Instant::now()));
+    }
+
+    /// Drops a message shown for `MESSAGE_TTL` by `now`. Returns true when
+    /// one was dropped (the screen needs drawing).
+    pub fn expire_message(&mut self, now: Instant) -> bool {
+        let old = matches!(&self.message, Some((_, at)) if now.duration_since(*at) >= MESSAGE_TTL);
+        if old {
+            self.message = None;
+        }
+        old
     }
 
     /// The file to watch: the one being loaded, else the one shown, else
@@ -488,6 +502,18 @@ mod tests {
         assert_eq!(a.on_key(key('q'), VP), Action::None);
         assert_eq!(a.message(), None);
         assert_eq!(a.on_key(ctrl('c'), VP), Action::Quit);
+    }
+
+    #[test]
+    fn message_expires_after_ttl() {
+        let mut a = new_app();
+        a.set_message(Some("fx not found".into()));
+        let now = Instant::now();
+        assert!(!a.expire_message(now));
+        assert_eq!(a.message(), Some("fx not found"));
+        assert!(a.expire_message(now + MESSAGE_TTL));
+        assert_eq!(a.message(), None);
+        assert!(!a.expire_message(now + MESSAGE_TTL));
     }
 
     #[test]

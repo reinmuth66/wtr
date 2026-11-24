@@ -211,25 +211,20 @@ pub fn header_line(
     ])
 }
 
-/// `message` alone, at the right end of a full row of `width` columns (the
-/// row is filled so it covers what is drawn below it).
+/// The mark and `message`, at most `width` columns and no wider than the
+/// text, so that drawn at the right end it covers only its own cells.
 pub fn message_line(message: &str, width: u16) -> Line<'static> {
-    let width = width as usize;
-    let right = truncate_to(&format!("{} {message}", icons::ALERT), width);
-    let gap = width - right.width();
-    Line::from(vec![
-        Span::raw(" ".repeat(gap)),
-        Span::styled(right, Style::default().fg(theme::YELLOW)),
-    ])
+    let text = truncate_to(&format!("{} {message}", icons::ALERT), width as usize);
+    Line::styled(text, Style::default().fg(theme::YELLOW))
 }
 
 #[cfg(test)]
 mod tests {
     #[test]
-    fn message_line_fills_the_row() {
+    fn message_line_is_only_the_text() {
         let s = text_of(&message_line("fx not found", 30));
-        assert!(s.ends_with("fx not found") && s.width() == 30);
-        assert!(!s.contains(icons::FILE_OTHER));
+        assert!(s.ends_with("fx not found") && !s.starts_with(' '));
+        assert_eq!(s.width(), format!("{} fx not found", icons::ALERT).width());
         assert!(text_of(&message_line("nvim not found", 5)).width() <= 5);
     }
 

@@ -8,7 +8,9 @@ use ratatui::backend::{Backend, ClearType, CrosstermBackend};
 use ratatui::crossterm::event::{self, DisableFocusChange, EnableFocusChange, Event};
 use ratatui::crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
 use ratatui::crossterm::{cursor, execute};
-use ratatui::layout::{Constraint, Layout};
+// Used by the header line, which is off (issue #1).
+// use ratatui::layout::{Constraint, Layout};
+use ratatui::layout::Rect;
 use ratatui::widgets::Paragraph;
 use ratatui::{Frame, Terminal};
 use ratatui_image::StatefulImage;
@@ -240,11 +242,18 @@ fn render(f: &mut Frame, app: &App, image: &mut Option<StatefulProtocol>) {
     // );
     let body = f.area();
     render_body(f, app, image, body);
-    // A message (e.g. `fx not found`) goes over the first row until the next key.
+    // A message (e.g. `fx not found`) goes over the right end of the first
+    // row, covering only its own cells, until the next key or it expires.
     if let Some(m) = app.message() {
-        let [head, _] =
-            Layout::vertical([Constraint::Length(1), Constraint::Fill(1)]).areas(body);
-        f.render_widget(message_line(m, head.width), head);
+        let line = message_line(m, body.width);
+        let w = line.width() as u16;
+        let at = Rect {
+            x: body.right() - w,
+            y: body.y,
+            width: w,
+            height: body.height.min(1),
+        };
+        f.render_widget(line, at);
     }
 }
 
@@ -252,7 +261,7 @@ fn render_body(
     f: &mut Frame,
     app: &App,
     image: &mut Option<StatefulProtocol>,
-    body: ratatui::layout::Rect,
+    body: Rect,
 ) {
     let shown = app.shown();
     let Some(s) = shown else {
@@ -358,6 +367,9 @@ impl Viewer {
                 self.redraw_all()?;
             }
             highlighting = self.app.tick_highlight(HL_BUDGET);
+            // The loop wakes at least every `IDLE_WAIT`, so a message goes
+            // within that much of `MESSAGE_TTL`; the next `draw` clears it.
+            self.app.expire_message(std::time::Instant::now());
         }
     }
 

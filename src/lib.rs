@@ -9,6 +9,7 @@ pub mod icons;
 pub mod kind;
 pub mod loader;
 pub mod records;
+pub mod row_text;
 pub mod state;
 pub mod tail;
 pub mod text_doc;

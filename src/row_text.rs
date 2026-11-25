@@ -56,8 +56,8 @@ pub fn status_mark(s: Status) -> (&'static str, Color) {
     match s {
         Status::Ok => (icons::OK, theme::GREEN),
         Status::Failed => (icons::FAILED, theme::RED),
-        Status::Rejected => (icons::REJECTED, theme::PEACH),
-        Status::Interrupted => (icons::INTERRUPTED, theme::YELLOW),
+        Status::Rejected => (icons::REJECTED, theme::YELLOW),
+        Status::Interrupted => (icons::INTERRUPTED, theme::PEACH),
         Status::Running => (icons::RUNNING, theme::SKY),
     }
 }
@@ -296,11 +296,11 @@ fn tool_note(t: &ToolRow) -> Vec<Span<'static>> {
         }
         Status::Rejected => vec![Span::styled(
             "(rejected)",
-            Style::default().fg(theme::PEACH),
+            Style::default().fg(theme::YELLOW),
         )],
         Status::Interrupted => vec![Span::styled(
             "(interrupted)",
-            Style::default().fg(theme::YELLOW),
+            Style::default().fg(theme::PEACH),
         )],
         Status::Running => vec![Span::styled("(running)", Style::default().fg(theme::SKY))],
         Status::Ok => ok_tool_note(t),
@@ -955,5 +955,34 @@ mod tests {
         assert!(line.contains("compacted · manual"));
         assert!(line.contains("630k → 10k"));
         assert_eq!(buf[(59, 0)].symbol(), "k");
+    }
+
+    #[test]
+    fn status_marks_and_note_colors() {
+        assert_eq!(status_mark(Status::Ok), (icons::OK, theme::GREEN));
+        assert_eq!(status_mark(Status::Failed), (icons::FAILED, theme::RED));
+        assert_eq!(
+            status_mark(Status::Rejected),
+            (icons::REJECTED, theme::YELLOW)
+        );
+        assert_eq!(
+            status_mark(Status::Interrupted),
+            (icons::INTERRUPTED, theme::PEACH)
+        );
+        assert_eq!(status_mark(Status::Running), (icons::RUNNING, theme::SKY));
+
+        let ctx = Ctx {
+            home: None,
+            icon_width: 1,
+        };
+        let rejected = tool_row("Bash", json!({"command": "rm"}), Status::Rejected);
+        let rej_note = row_text(&Row::Tool(rejected), &ctx).note;
+        assert_eq!(rej_note[0].content.as_ref(), "(rejected)");
+        assert_eq!(rej_note[0].style.fg, Some(theme::YELLOW));
+
+        let interrupted = tool_row("Bash", json!({"command": "sleep 1"}), Status::Interrupted);
+        let int_note = row_text(&Row::Tool(interrupted), &ctx).note;
+        assert_eq!(int_note[0].content.as_ref(), "(interrupted)");
+        assert_eq!(int_note[0].style.fg, Some(theme::PEACH));
     }
 }

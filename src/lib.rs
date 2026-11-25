@@ -9,6 +9,7 @@ pub mod kind;
 pub mod loader;
 pub mod records;
 pub mod state;
+pub mod tail;
 pub mod text_doc;
 pub mod theme;
 pub mod view;

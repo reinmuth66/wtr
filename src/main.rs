@@ -390,6 +390,7 @@ impl Viewer {
                 self.watching.clear();
                 Ok(false)
             }
+            AppEvent::SessionRead(_) => Ok(false),
         }
     }
 

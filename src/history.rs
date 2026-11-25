@@ -303,12 +303,7 @@ impl History {
 
         match content {
             Value::String(s) => {
-                self.maybe_handle_handback(s);
-                if s.trim() == INTERRUPT_TOOL_TEXT {
-                    saw_interrupt_tool = true;
-                } else if !is_meta && let Some(part) = filter_prompt_text(s) {
-                    prompt_parts.push(part);
-                }
+                self.handle_user_text(s, is_meta, &mut saw_interrupt_tool, &mut prompt_parts);
             }
             Value::Array(arr) => {
                 for item in arr {
@@ -318,12 +313,12 @@ impl History {
                     match item.get("type").and_then(Value::as_str) {
                         Some("text") => {
                             if let Some(s) = item.get("text").and_then(Value::as_str) {
-                                self.maybe_handle_handback(s);
-                                if s.trim() == INTERRUPT_TOOL_TEXT {
-                                    saw_interrupt_tool = true;
-                                } else if !is_meta && let Some(part) = filter_prompt_text(s) {
-                                    prompt_parts.push(part);
-                                }
+                                self.handle_user_text(
+                                    s,
+                                    is_meta,
+                                    &mut saw_interrupt_tool,
+                                    &mut prompt_parts,
+                                );
                             }
                         }
                         Some("image") if !is_meta => {
@@ -471,6 +466,10 @@ impl History {
         };
         match mode {
             "prompt" => {
+                self.maybe_handle_handback(prompt);
+                if filter_prompt_text(prompt).is_none() {
+                    return;
+                }
                 self.push_row(Row::Prompt(PromptRow {
                     prompt: Prompt::Text(prompt.to_string()),
                     duration_ms: None,
@@ -479,6 +478,24 @@ impl History {
             }
             "task-notification" => self.push_task_notification(prompt),
             _ => {}
+        }
+    }
+
+    fn handle_user_text(
+        &mut self,
+        s: &str,
+        is_meta: bool,
+        saw_interrupt_tool: &mut bool,
+        prompt_parts: &mut Vec<String>,
+    ) {
+        self.maybe_handle_handback(s);
+        if s.trim().starts_with("<task-notification>") {
+            self.push_task_notification(s);
+        }
+        if s.trim() == INTERRUPT_TOOL_TEXT {
+            *saw_interrupt_tool = true;
+        } else if !is_meta && let Some(part) = filter_prompt_text(s) {
+            prompt_parts.push(part);
         }
     }
 
@@ -639,7 +656,10 @@ fn parse_agent_usage(s: &str) -> AgentUsage {
 }
 
 fn parse_handback(s: &str) -> Option<(String, String)> {
-    if !s.starts_with("Another Claude session sent a message:") {
+    let trimmed = s.trim();
+    if !trimmed.starts_with("Another Claude session sent a message:")
+        && !trimmed.starts_with("<agent-message from=")
+    {
         return None;
     }
     let from_prefix = "<agent-message from=\"";
@@ -689,6 +709,7 @@ fn filter_prompt_text(s: &str) -> Option<String> {
         || trimmed.starts_with("<bash-")
         || trimmed.starts_with("<task-notification>")
         || trimmed.starts_with("Another Claude session sent a message:")
+        || trimmed.starts_with("<agent-message")
         || trimmed == INTERRUPT_TEXT
         || trimmed == INTERRUPT_TOOL_TEXT
     {
@@ -1284,5 +1305,94 @@ mod tests {
             }
             _ => panic!("expected Tool rows"),
         }
+    }
+
+    #[test]
+    fn user_record_task_notification() {
+        let mut h = History::new();
+        h.push(&tool_use("t1", "Agent", json!({})));
+        h.push(&tool_result(
+            "t1",
+            "launched",
+            false,
+            json!({ "status": "async_launched", "agentId": "a1" }),
+        ));
+        let rev_before = h.revision(0);
+
+        h.push(&user_text(
+            "<task-notification>\n<task-id>a1</task-id>\n<tool-use-id>t1</tool-use-id>\n<status>completed</status>\n<usage>subagent_tokens: 500\ntool_uses: 3\nduration_ms: 1200</usage>\n</task-notification>",
+        ));
+        assert_eq!(h.rows.len(), 1);
+        assert!(h.revision(0) > rev_before);
+        match &h.rows[0] {
+            Row::Tool(t) => {
+                assert_eq!(t.status, Status::Ok);
+                assert_eq!(
+                    t.usage,
+                    Some(AgentUsage {
+                        tokens: 500,
+                        tool_uses: 3,
+                        duration_ms: 1200,
+                    })
+                );
+            }
+            _ => panic!("expected Tool row"),
+        }
+
+        h.push(&json!({
+            "type": "user",
+            "message": {
+                "content": [
+                    {
+                        "type": "text",
+                        "text": "  <task-notification><tool-use-id>t1</tool-use-id><status>failed</status></task-notification>"
+                    }
+                ]
+            }
+        }));
+        assert_eq!(h.rows.len(), 1);
+        match &h.rows[0] {
+            Row::Tool(t) => assert_eq!(t.status, Status::Failed),
+            _ => panic!("expected Tool row"),
+        }
+    }
+
+    #[test]
+    fn queued_prompt_handback_and_agent_message() {
+        let mut h = History::new();
+        h.push(&tool_use("t1", "Agent", json!({})));
+        h.push(&tool_result(
+            "t1",
+            "done",
+            false,
+            json!({ "agentId": "a1" }),
+        ));
+        let rev_before = h.revision(0);
+
+        h.push(&attachment(
+            "queued_command",
+            json!({
+                "commandMode": "prompt",
+                "prompt": "<agent-message from=\"a1\">\n[Subagent hand-back]\nキュー経由の報告\n</agent-message>"
+            }),
+        ));
+        assert_eq!(h.rows.len(), 1);
+        assert!(h.revision(0) > rev_before);
+        match &h.rows[0] {
+            Row::Tool(t) => assert_eq!(t.report.as_deref(), Some("キュー経由の報告")),
+            _ => panic!("expected Tool row"),
+        }
+
+        h.push(&attachment(
+            "queued_command",
+            json!({
+                "commandMode": "prompt",
+                "prompt": "<agent-message from=\"a2\">\nnot a hand-back\n</agent-message>"
+            }),
+        ));
+        h.push(&user_text(
+            "<agent-message from=\"a3\">\nnot a hand-back\n</agent-message>",
+        ));
+        assert_eq!(h.rows.len(), 1);
     }
 }

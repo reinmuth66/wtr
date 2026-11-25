@@ -161,12 +161,12 @@
 - hook の出力は、`type` が `attachment` で `attachment.type` が `hook_success`、`hook_non_blocking_error`、`hook_blocking_error` の記録にある (失敗の 2 つは小見出しを red にする) (`hookEvent`、`hookName`、`stdout`、`stderr`、`exitCode`、`toolUseID`)。`toolUseID` で道具の行に結ぶ。`PostToolUse` 以外 (`SessionStart`、`Stop`) は道具に結ばないので出さない
 - `isSidechain` が真の記録は、親の jsonl には無く、`subagents/` の下の別のファイルにある。飛ばす決まりは念のための守りとして残す
 - 行の種類は「道具の呼び出し」(tool_use の id が単位)、「指示」、「要約の区切り」の 3 つだけにする。サブエージェントの報告と背景のエージェントの完了通知は新しい行にせず、元の Agent の行に結ぶ (設計者の判断)
-- 背景のエージェント (2026-11-23 に実際の jsonl で確かめた):
+- 背景のエージェント (2026-11-23 に実際の jsonl で確かめた。2026-11-25 に 2.1.331 の記録で下の別形も確かめた):
   - Agent を背景で動かすと、`tool_result` は起動した直後に返る。中身は `Async agent launched successfully...` で、`toolUseResult` は `status: "async_launched"` と `agentId` を持ち、道具の回数、トークン数、時間は持たない。この `tool_result` では成功にせず、実行中のままにする
-  - 終わると、`type` が `attachment` で `attachment.type` が `queued_command`、`commandMode` が `task-notification` の記録が来る。`attachment.prompt` の `<task-notification>` の中の `<tool-use-id>` で元の Agent の行に結び、`<status>` で状態を決める (`completed` は成功、それ以外は失敗)。`<usage>` の `subagent_tokens`、`tool_uses`、`duration_ms` で補足を作る。同じエージェントが続けて動くと、通知は何度も来る (最後のものを使う)。通知の `<summary>` が「自分の背景の仕事を待っている」ことを示す途中の通知でも、状態は `<status>` のとおりにする
-  - サブエージェントの報告は、親の jsonl では user の記録として届く。文は `Another Claude session sent a message:` で始まり、`<agent-message from="<agentId>">` と `[Subagent hand-back]` の印のあとに報告の全文が続く。`from` の値と Agent の `toolUseResult.agentId` で元の Agent の行に結び、展開の `─ result ─` に出す。報告が無ければ `─ result ─` には `tool_result` の中身を出す
+  - 終わると、`type` が `attachment` で `attachment.type` が `queued_command`、`commandMode` が `task-notification` の記録が来る。文が `<task-notification>` で始まる user の記録 (`origin.kind` が `task-notification`) として届くこともある。どちらも同じく、`<task-notification>` の中の `<tool-use-id>` で元の Agent の行に結び、`<status>` で状態を決める (`completed` は成功、それ以外は失敗)。`<usage>` の `subagent_tokens`、`tool_uses`、`duration_ms` で補足を作る。同じエージェントが続けて動くと、通知は何度も来る (最後のものを使う)。通知の `<summary>` が「自分の背景の仕事を待っている」ことを示す途中の通知でも、状態は `<status>` のとおりにする。指示の行にはしない
+  - サブエージェントの報告は、親の jsonl では user の記録、または `type` が `attachment` で `attachment.type` が `queued_command`、`commandMode` が `prompt` の記録として届く。文は `Another Claude session sent a message:` または `<agent-message from=` で始まり、`<agent-message from="<agentId>">` と `[Subagent hand-back]` の印のあとに報告の全文が続く。`from` の値と Agent の `toolUseResult.agentId` で元の Agent の行に結び、展開の `─ result ─` に出す。報告が無ければ `─ result ─` には `tool_result` の中身を出す。指示の行にはしない
   - サブエージェントの中の `SubagentHandback` の呼び出しは、`subagents/agent-<agentId>.jsonl` にだけあり、親の jsonl には無い
-  - `[Subagent hand-back]` の印の無い `agent-message` (ほかのセッションからの知らせ) は、どの行にもしない
+  - `[Subagent hand-back]` の印の無い `agent-message` (ほかのセッションからの知らせ) は、user の記録でも `queued_command` (`commandMode` が `prompt`) でも、どの行にもしない
   - 背景で動かさない Agent は、今までどおり `tool_result` と `toolUseResult` から結果と補足を取る
 - 要約の区切りの行: `type` が `system` で `subtype` が `compact_boundary` の記録で作る。`compactMetadata` から、手動か自動か (`trigger`) と前後のトークン数 (`preTokens`、`postTokens`) を取る。直後の `isCompactSummary` が真の user の記録の中身 (要約の全文) を、この行の中身にする
 - セッション (`session` の値) が変わったら、読み直す

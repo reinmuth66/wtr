@@ -125,7 +125,9 @@ pub enum Row {
 pub struct History {
     pub rows: Vec<Row>,
     id_to_row: HashMap<String, usize>,
+    agent_to_row: HashMap<String, usize>,
     pending_results: HashMap<String, (ToolResult, Status)>,
+    pending_reports: HashMap<String, String>,
     revisions: Vec<u64>,
     rev_counter: u64,
     last_linked_results: Vec<usize>,
@@ -154,6 +156,11 @@ impl History {
             "system:local_command" => self.push_local_command(rec),
             "system:turn_duration" => self.push_turn_duration(rec),
             "attachment:queued_command" => self.push_queued_command(rec),
+            "attachment:hook_success" => self.push_hook(rec, HookKind::Success),
+            "attachment:hook_non_blocking_error" => self.push_hook(rec, HookKind::NonBlockingError),
+            "attachment:hook_blocking_error" => self.push_hook(rec, HookKind::BlockingError),
+            "attachment:hook_cancelled" => self.push_hook(rec, HookKind::Cancelled),
+            "attachment:diagnostics" => self.push_diagnostics(rec),
             _ => {}
         }
     }
@@ -230,12 +237,25 @@ impl History {
                 hooks: Vec::new(),
                 diagnostics: Vec::new(),
             };
+            let mut agent_id = None;
             if let Some((result, status)) = self.pending_results.remove(id) {
+                agent_id = result
+                    .extra
+                    .get("agentId")
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
                 row.result = Some(result);
                 row.status = status;
+                if let Some(ref aid) = agent_id {
+                    row.agent_id = Some(aid.clone());
+                    row.report = self.pending_reports.remove(aid);
+                }
             }
             let idx = self.push_row(Row::Tool(row));
             self.id_to_row.insert(id.to_string(), idx);
+            if let Some(aid) = agent_id {
+                self.agent_to_row.insert(aid, idx);
+            }
             self.last_linked_results.clear();
         }
     }
@@ -283,6 +303,7 @@ impl History {
 
         match content {
             Value::String(s) => {
+                self.maybe_handle_handback(s);
                 if s.trim() == INTERRUPT_TOOL_TEXT {
                     saw_interrupt_tool = true;
                 } else if !is_meta && let Some(part) = filter_prompt_text(s) {
@@ -297,6 +318,7 @@ impl History {
                     match item.get("type").and_then(Value::as_str) {
                         Some("text") => {
                             if let Some(s) = item.get("text").and_then(Value::as_str) {
+                                self.maybe_handle_handback(s);
                                 if s.trim() == INTERRUPT_TOOL_TEXT {
                                     saw_interrupt_tool = true;
                                 } else if !is_meta && let Some(part) = filter_prompt_text(s) {
@@ -338,7 +360,9 @@ impl History {
             .and_then(Value::as_bool)
             .unwrap_or(false);
         let text = extract_text(item.get("content"));
-        let status = if !is_error {
+        let status = if extra.get("status").and_then(Value::as_str) == Some("async_launched") {
+            Status::Running
+        } else if !is_error {
             Status::Ok
         } else if text.starts_with(REJECTION_PREFIX) {
             Status::Rejected
@@ -352,11 +376,24 @@ impl History {
         };
 
         if let Some(&idx) = self.id_to_row.get(tool_use_id) {
+            let agent_id = extra
+                .get("agentId")
+                .and_then(Value::as_str)
+                .map(str::to_string);
             if let Some(Row::Tool(row)) = self.rows.get_mut(idx) {
                 row.result = Some(result);
                 row.status = status;
+                if let Some(ref aid) = agent_id {
+                    row.agent_id = Some(aid.clone());
+                    if let Some(report) = self.pending_reports.remove(aid) {
+                        row.report = Some(report);
+                    }
+                }
                 self.bump(idx);
                 self.last_linked_results.push(idx);
+            }
+            if let Some(aid) = agent_id {
+                self.agent_to_row.insert(aid, idx);
             }
         } else {
             self.pending_results
@@ -426,17 +463,208 @@ impl History {
         let Some(att) = rec.get("attachment") else {
             return;
         };
-        if att.get("commandMode").and_then(Value::as_str) != Some("prompt") {
+        let Some(mode) = att.get("commandMode").and_then(Value::as_str) else {
             return;
-        }
+        };
         let Some(prompt) = att.get("prompt").and_then(Value::as_str) else {
             return;
         };
-        self.push_row(Row::Prompt(PromptRow {
-            prompt: Prompt::Text(prompt.to_string()),
-            duration_ms: None,
-        }));
-        self.last_linked_results.clear();
+        match mode {
+            "prompt" => {
+                self.push_row(Row::Prompt(PromptRow {
+                    prompt: Prompt::Text(prompt.to_string()),
+                    duration_ms: None,
+                }));
+                self.last_linked_results.clear();
+            }
+            "task-notification" => self.push_task_notification(prompt),
+            _ => {}
+        }
+    }
+
+    fn push_task_notification(&mut self, prompt: &str) {
+        let Some(tool_use_id) = extract_tag(prompt, "tool-use-id") else {
+            return;
+        };
+        let Some(&idx) = self.id_to_row.get(&tool_use_id) else {
+            return;
+        };
+        let status = if extract_tag(prompt, "status").as_deref() == Some("completed") {
+            Status::Ok
+        } else {
+            Status::Failed
+        };
+        let usage = extract_tag(prompt, "usage").map(|u| parse_agent_usage(&u));
+        if let Some(Row::Tool(row)) = self.rows.get_mut(idx) {
+            row.status = status;
+            row.usage = usage;
+            self.bump(idx);
+        }
+    }
+
+    fn maybe_handle_handback(&mut self, s: &str) {
+        let Some((from, report)) = parse_handback(s) else {
+            return;
+        };
+        if let Some(&idx) = self.agent_to_row.get(&from) {
+            if let Some(Row::Tool(row)) = self.rows.get_mut(idx) {
+                row.report = Some(report);
+                self.bump(idx);
+            }
+        } else {
+            self.pending_reports.insert(from, report);
+        }
+    }
+
+    fn push_hook(&mut self, rec: &Value, kind: HookKind) {
+        let Some(att) = rec.get("attachment") else {
+            return;
+        };
+        let Some(event) = att.get("hookEvent").and_then(Value::as_str) else {
+            return;
+        };
+        if event != "PostToolUse" {
+            return;
+        }
+        let Some(tool_use_id) = att.get("toolUseID").and_then(Value::as_str) else {
+            return;
+        };
+        let Some(&idx) = self.id_to_row.get(tool_use_id) else {
+            return;
+        };
+        let hook = Hook {
+            kind,
+            event: event.to_string(),
+            name: att
+                .get("hookName")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string(),
+            stdout: att
+                .get("stdout")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string(),
+            stderr: att
+                .get("stderr")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string(),
+            exit_code: att.get("exitCode").and_then(parse_exit_code),
+        };
+        if let Some(Row::Tool(row)) = self.rows.get_mut(idx) {
+            row.hooks.push(hook);
+            self.bump(idx);
+        }
+    }
+
+    fn push_diagnostics(&mut self, rec: &Value) {
+        let Some(files) = rec
+            .get("attachment")
+            .and_then(|a| a.get("files"))
+            .and_then(Value::as_array)
+        else {
+            return;
+        };
+        for file in files {
+            let Some(uri) = file.get("uri").and_then(Value::as_str) else {
+                continue;
+            };
+            let path = uri.strip_prefix("file://").unwrap_or(uri);
+            let Some(diags) = file.get("diagnostics").and_then(Value::as_array) else {
+                continue;
+            };
+            if diags.is_empty() {
+                continue;
+            }
+            let Some((idx, Row::Tool(row))) =
+                self.rows.iter_mut().enumerate().rev().find(|(_, r)| {
+                    matches!(
+                        r,
+                        Row::Tool(t)
+                            if (t.name == "Edit" || t.name == "Write")
+                                && t.input.get("file_path").and_then(Value::as_str) == Some(path)
+                    )
+                })
+            else {
+                continue;
+            };
+            for d in diags {
+                let severity = match d.get("severity").and_then(Value::as_str) {
+                    Some("Error") => Severity::Error,
+                    Some("Warning") => Severity::Warning,
+                    Some("Hint") => Severity::Hint,
+                    _ => Severity::Information,
+                };
+                let line = d
+                    .get("range")
+                    .and_then(|r| r.get("start"))
+                    .and_then(|s| s.get("line"))
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0)
+                    + 1;
+                let message = d
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                row.diagnostics.push(Diagnostic {
+                    severity,
+                    line,
+                    message,
+                });
+            }
+            self.bump(idx);
+        }
+    }
+}
+
+fn parse_agent_usage(s: &str) -> AgentUsage {
+    let mut usage = AgentUsage {
+        tokens: 0,
+        tool_uses: 0,
+        duration_ms: 0,
+    };
+    for line in s.lines() {
+        let trimmed = line.trim();
+        if let Some(val) = trimmed.strip_prefix("subagent_tokens:") {
+            usage.tokens = val.trim().parse().unwrap_or(0);
+        } else if let Some(val) = trimmed.strip_prefix("tool_uses:") {
+            usage.tool_uses = val.trim().parse().unwrap_or(0);
+        } else if let Some(val) = trimmed.strip_prefix("duration_ms:") {
+            usage.duration_ms = val.trim().parse().unwrap_or(0);
+        }
+    }
+    usage
+}
+
+fn parse_handback(s: &str) -> Option<(String, String)> {
+    if !s.starts_with("Another Claude session sent a message:") {
+        return None;
+    }
+    let from_prefix = "<agent-message from=\"";
+    let from_start = s.find(from_prefix)? + from_prefix.len();
+    let from_end = s[from_start..].find('"')? + from_start;
+    let from = &s[from_start..from_end];
+    if from.is_empty() {
+        return None;
+    }
+    let marker = "[Subagent hand-back]";
+    let marker_pos = s.find(marker)?;
+    let line_end = s[marker_pos..].find('\n')? + marker_pos;
+    let rest = &s[line_end + 1..];
+    let body = match rest.find("</agent-message>") {
+        Some(end) => &rest[..end],
+        None => rest,
+    };
+    Some((from.to_string(), body.trim().to_string()))
+}
+
+fn parse_exit_code(val: &Value) -> Option<i64> {
+    match val {
+        Value::Number(n) => n.as_i64(),
+        Value::String(s) => s.trim().parse::<i64>().ok(),
+        _ => None,
     }
 }
 
@@ -844,5 +1072,217 @@ mod tests {
         h.push(&user_text("second"));
 
         assert_eq!(h.tool_counts(0), (1, 1));
+    }
+
+    #[test]
+    fn background_agent_runs_until_notified() {
+        let mut h = History::new();
+        h.push(&tool_use("t1", "Agent", json!({})));
+        h.push(&tool_result(
+            "t1",
+            "launched",
+            false,
+            json!({ "status": "async_launched", "agentId": "a1" }),
+        ));
+        match &h.rows[0] {
+            Row::Tool(t) => {
+                assert_eq!(t.status, Status::Running);
+                assert_eq!(t.agent_id.as_deref(), Some("a1"));
+            }
+            _ => panic!("expected Tool row"),
+        }
+        let rev_before = h.revision(0);
+
+        h.push(&attachment(
+            "queued_command",
+            json!({
+                "commandMode": "task-notification",
+                "prompt": "<task-notification><tool-use-id>t1</tool-use-id><status>completed</status><usage>subagent_tokens: 113000\ntool_uses: 36\nduration_ms: 185000</usage></task-notification>"
+            }),
+        ));
+        assert!(h.revision(0) > rev_before);
+        match &h.rows[0] {
+            Row::Tool(t) => {
+                assert_eq!(t.status, Status::Ok);
+                assert_eq!(
+                    t.usage,
+                    Some(AgentUsage {
+                        tokens: 113000,
+                        tool_uses: 36,
+                        duration_ms: 185000,
+                    })
+                );
+            }
+            _ => panic!("expected Tool row"),
+        }
+    }
+
+    #[test]
+    fn last_notification_wins() {
+        let mut h = History::new();
+        h.push(&tool_use("t1", "Agent", json!({})));
+        h.push(&tool_result(
+            "t1",
+            "launched",
+            false,
+            json!({ "status": "async_launched", "agentId": "a1" }),
+        ));
+        h.push(&attachment(
+            "queued_command",
+            json!({
+                "commandMode": "task-notification",
+                "prompt": "<task-notification><tool-use-id>t1</tool-use-id><status>completed</status></task-notification>"
+            }),
+        ));
+        h.push(&attachment(
+            "queued_command",
+            json!({
+                "commandMode": "task-notification",
+                "prompt": "<task-notification><tool-use-id>t1</tool-use-id><status>killed</status></task-notification>"
+            }),
+        ));
+        match &h.rows[0] {
+            Row::Tool(t) => assert_eq!(t.status, Status::Failed),
+            _ => panic!("expected Tool row"),
+        }
+    }
+
+    #[test]
+    fn handback_before_and_after_agent_id() {
+        let mut h = History::new();
+        h.push(&user_text(
+            "Another Claude session sent a message:\n<agent-message from=\"a1\">\n[Subagent hand-back]\n報告\n</agent-message>",
+        ));
+        assert!(h.rows.is_empty());
+
+        h.push(&tool_use("t1", "Agent", json!({})));
+        h.push(&tool_result(
+            "t1",
+            "done",
+            false,
+            json!({ "agentId": "a1" }),
+        ));
+        assert_eq!(h.rows.len(), 1);
+        match &h.rows[0] {
+            Row::Tool(t) => assert_eq!(t.report.as_deref(), Some("報告")),
+            _ => panic!("expected Tool row"),
+        }
+
+        h.push(&tool_use("t2", "Agent", json!({})));
+        h.push(&tool_result(
+            "t2",
+            "done",
+            false,
+            json!({ "agentId": "a2" }),
+        ));
+        let rev_before = h.revision(1);
+        h.push(&user_text(
+            "Another Claude session sent a message:\n<agent-message from=\"a2\">\n[Subagent hand-back]\n後の報告\n</agent-message>",
+        ));
+        assert!(h.revision(1) > rev_before);
+        match &h.rows[1] {
+            Row::Tool(t) => assert_eq!(t.report.as_deref(), Some("後の報告")),
+            _ => panic!("expected Tool row"),
+        }
+
+        h.push(&tool_use("t3", "Agent", json!({})));
+        h.push(&tool_result(
+            "t3",
+            "done",
+            false,
+            json!({ "agentId": "a3" }),
+        ));
+        h.push(&user_text(
+            "Another Claude session sent a message:\n<agent-message from=\"a3\">\nnot a hand-back\n</agent-message>",
+        ));
+        assert_eq!(h.rows.len(), 3);
+        match &h.rows[2] {
+            Row::Tool(t) => assert_eq!(t.report, None),
+            _ => panic!("expected Tool row"),
+        }
+    }
+
+    #[test]
+    fn post_tool_use_hooks_only() {
+        let mut h = History::new();
+        h.push(&tool_use("t1", "Bash", json!({})));
+        let rev_before = h.revision(0);
+        h.push(&attachment(
+            "hook_blocking_error",
+            json!({
+                "hookEvent": "PostToolUse",
+                "toolUseID": "t1",
+                "hookName": "lint",
+                "stdout": "out",
+                "stderr": "err",
+                "exitCode": "2"
+            }),
+        ));
+        assert!(h.revision(0) > rev_before);
+        h.push(&attachment(
+            "hook_success",
+            json!({
+                "hookEvent": "SessionStart",
+                "toolUseID": "t1",
+                "hookName": "init"
+            }),
+        ));
+        match &h.rows[0] {
+            Row::Tool(t) => {
+                assert_eq!(t.hooks.len(), 1);
+                assert_eq!(t.hooks[0].kind, HookKind::BlockingError);
+                assert_eq!(t.hooks[0].event, "PostToolUse");
+                assert_eq!(t.hooks[0].name, "lint");
+                assert_eq!(t.hooks[0].stdout, "out");
+                assert_eq!(t.hooks[0].stderr, "err");
+                assert_eq!(t.hooks[0].exit_code, Some(2));
+            }
+            _ => panic!("expected Tool row"),
+        }
+    }
+
+    #[test]
+    fn diagnostics_join_the_last_edit_of_the_path() {
+        let mut h = History::new();
+        h.push(&tool_use("e1", "Edit", json!({ "file_path": "/p/a.rs" })));
+        h.push(&tool_use("e2", "Edit", json!({ "file_path": "/p/b.rs" })));
+        h.push(&tool_use("e3", "Edit", json!({ "file_path": "/p/a.rs" })));
+        let rev_before = h.revision(2);
+
+        h.push(&attachment(
+            "diagnostics",
+            json!({
+                "files": [
+                    {
+                        "uri": "file:///p/a.rs",
+                        "diagnostics": [
+                            { "severity": "Error", "range": { "start": { "line": 0 } }, "message": "err" }
+                        ]
+                    },
+                    {
+                        "uri": "file:///p/unknown.rs",
+                        "diagnostics": [
+                            { "severity": "Warning", "range": { "start": { "line": 5 } }, "message": "warn" }
+                        ]
+                    }
+                ]
+            }),
+        ));
+        assert!(h.revision(2) > rev_before);
+        match (&h.rows[0], &h.rows[1], &h.rows[2]) {
+            (Row::Tool(t0), Row::Tool(t1), Row::Tool(t2)) => {
+                assert!(t0.diagnostics.is_empty());
+                assert!(t1.diagnostics.is_empty());
+                assert_eq!(
+                    t2.diagnostics,
+                    vec![Diagnostic {
+                        severity: Severity::Error,
+                        line: 1,
+                        message: "err".to_string(),
+                    }]
+                );
+            }
+            _ => panic!("expected Tool rows"),
+        }
     }
 }

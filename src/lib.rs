@@ -4,6 +4,7 @@ pub mod csv_table;
 pub mod event;
 pub mod external;
 pub mod highlight;
+pub mod history;
 pub mod icons;
 pub mod kind;
 pub mod loader;

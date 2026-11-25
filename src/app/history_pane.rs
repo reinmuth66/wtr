@@ -121,11 +121,13 @@ impl HistoryPane {
                 s.history = History::new();
                 s.offset = 0;
                 self.detail = None;
+                *nav = Nav::default();
             }
             Ok(chunk) => {
                 if chunk.reset {
                     s.history = History::new();
                     self.detail = None;
+                    *nav = Nav::default();
                 }
                 for rec in &chunk.records {
                     s.history.push(rec);

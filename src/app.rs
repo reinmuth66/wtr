@@ -1305,4 +1305,60 @@ mod tests {
         };
         assert_eq!(a.history_view(tall).unwrap().nav.detail_scroll, 0);
     }
+
+    #[test]
+    fn session_rewrite_resets_nav() {
+        let s = PathBuf::from("/tmp/s.jsonl");
+        let mut a = new_app();
+        let actions = a.on_state_bytes(&state_with_session(Some("1"), None, Some(&s)));
+        let gen1 = actions
+            .iter()
+            .find_map(|act| match act {
+                Action::ReadSession { generation, .. } => Some(*generation),
+                _ => None,
+            })
+            .unwrap();
+        a.on_session_read(
+            crate::tail::SessionRead {
+                generation: gen1,
+                result: Ok(crate::tail::Chunk {
+                    records: vec![prompt_rec("one"), prompt_rec("two"), prompt_rec("three")],
+                    end: 100,
+                    reset: false,
+                }),
+            },
+            VP,
+        );
+        a.on_key(key('k'), VP);
+        a.on_key(key('l'), VP);
+        let v = a.history_view(VP).unwrap();
+        assert!(!v.nav.follow);
+        assert!(v.nav.expanded);
+        assert_eq!(v.nav.selected, 1);
+
+        let fs_actions = a.on_fs_change(&s);
+        let gen2 = fs_actions
+            .iter()
+            .find_map(|act| match act {
+                Action::ReadSession { generation, .. } => Some(*generation),
+                _ => None,
+            })
+            .unwrap();
+        a.on_session_read(
+            crate::tail::SessionRead {
+                generation: gen2,
+                result: Ok(crate::tail::Chunk {
+                    records: vec![prompt_rec("a"), prompt_rec("b")],
+                    end: 40,
+                    reset: true,
+                }),
+            },
+            VP,
+        );
+        let v2 = a.history_view(VP).unwrap();
+        assert!(v2.nav.follow);
+        assert!(!v2.nav.expanded);
+        assert_eq!(v2.nav.selected, 1);
+        assert_eq!(v2.nav.detail_scroll, 0);
+    }
 }

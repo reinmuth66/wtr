@@ -111,15 +111,21 @@ pub fn run_delta(diff: &str, digits: usize, path_var: Option<&OsStr>) -> Result<
         .spawn()
         .map_err(|e| format!("failed to spawn delta: {e}"))?;
 
-    if let Some(mut stdin) = child.stdin.take() {
-        stdin
-            .write_all(diff.as_bytes())
-            .map_err(|e| format!("failed to write to delta stdin: {e}"))?;
-    }
+    let writer = child.stdin.take().map(|mut stdin| {
+        let bytes = diff.as_bytes().to_vec();
+        std::thread::spawn(move || stdin.write_all(&bytes))
+    });
 
     let output = child
         .wait_with_output()
         .map_err(|e| format!("failed to wait for delta: {e}"))?;
+
+    if let Some(handle) = writer {
+        handle
+            .join()
+            .map_err(|_| String::from("delta stdin writer thread panicked"))?
+            .map_err(|e| format!("failed to write to delta stdin: {e}"))?;
+    }
     if !output.status.success() {
         return Err(String::from_utf8_lossy(&output.stderr).into_owned());
     }
@@ -311,6 +317,28 @@ mod tests {
         let out = run_delta(&diff, 2, path_var.as_deref()).unwrap();
         assert!(out.contains("\x1b["));
         assert!(!out.contains("a/x.rs"));
+    }
+
+    #[test]
+    fn delta_handles_large_diff() {
+        let path_var = std::env::var_os("PATH");
+        if crate::external::find_in_path("delta", path_var.as_deref()).is_none() {
+            return;
+        }
+        let lines: Vec<String> = (0..20_000)
+            .map(|i| format!("+let line_{i:05} = \"padding_to_exceed_one_megabyte_easily\";"))
+            .collect();
+        let patch = json!([{
+            "oldStart": 1,
+            "oldLines": 0,
+            "newStart": 1,
+            "newLines": lines.len(),
+            "lines": lines,
+        }]);
+        let diff = unified_diff("large.rs", &patch).unwrap();
+        assert!(diff.len() >= 1_048_576);
+        let out = run_delta(&diff, 5, path_var.as_deref()).unwrap();
+        assert!(!out.is_empty());
     }
 
     #[test]

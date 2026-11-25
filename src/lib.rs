@@ -10,6 +10,7 @@ pub mod history;
 pub mod icons;
 pub mod kind;
 pub mod loader;
+pub mod nav;
 pub mod records;
 pub mod row_text;
 pub mod state;

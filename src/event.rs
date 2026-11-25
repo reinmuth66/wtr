@@ -6,4 +6,5 @@ pub enum AppEvent {
     Fs(Vec<PathBuf>),
     Loaded(crate::loader::Loaded),
     SessionRead(crate::tail::SessionRead),
+    Message(String),
 }

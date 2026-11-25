@@ -391,6 +391,10 @@ impl Viewer {
                 Ok(false)
             }
             AppEvent::SessionRead(_) => Ok(false),
+            AppEvent::Message(m) => {
+                self.app.set_message(Some(m));
+                Ok(false)
+            }
         }
     }
 

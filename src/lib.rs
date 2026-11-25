@@ -1,6 +1,7 @@
 pub mod app;
 pub mod cli;
 pub mod csv_table;
+pub mod diff;
 pub mod event;
 pub mod external;
 pub mod highlight;

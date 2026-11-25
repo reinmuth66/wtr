@@ -14,6 +14,7 @@ pub mod loader;
 pub mod nav;
 pub mod records;
 pub mod row_text;
+pub mod scan;
 pub mod state;
 pub mod tail;
 pub mod text_doc;

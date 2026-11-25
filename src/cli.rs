@@ -1,7 +1,7 @@
 use std::ffi::OsString;
 use std::path::PathBuf;
 
-use clap::{ArgGroup, Parser};
+use clap::{ArgGroup, Parser, Subcommand};
 
 /// What the viewer should follow.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -30,8 +30,20 @@ pub enum Command {
     ScanRecords(Vec<PathBuf>),
 }
 
+#[derive(Subcommand)]
+enum Sub {
+    /// Scan session JSONL files for unknown record kinds and missing fields
+    #[command(name = "scan-records")]
+    ScanRecords {
+        /// Files or directories to scan (defaults to ~/.claude/projects)
+        #[arg(value_name = "PATH")]
+        paths: Vec<PathBuf>,
+    },
+}
+
 #[derive(Parser)]
 #[command(version, about = "A TUI file viewer")]
+#[command(args_conflicts_with_subcommands = true, subcommand_negates_reqs = true)]
 #[command(group(
     ArgGroup::new("source")
         .required(true)
@@ -39,6 +51,8 @@ pub enum Command {
         .args(["state", "file", "session"])
 ))]
 struct Args {
+    #[command(subcommand)]
+    command: Option<Sub>,
     /// State file naming the file and session to show
     #[arg(long, value_name = "PATH", conflicts_with_all = ["file", "session"])]
     state: Option<PathBuf>,
@@ -62,6 +76,9 @@ where
     T: Into<OsString> + Clone,
 {
     let args = Args::try_parse_from(args)?;
+    if let Some(Sub::ScanRecords { paths }) = args.command {
+        return Ok(Command::ScanRecords(paths));
+    }
     let absolute = |p: PathBuf| {
         std::path::absolute(&p).map_err(|e| {
             clap::Error::raw(
@@ -179,5 +196,17 @@ mod tests {
     fn icon_width_must_be_1_or_2() {
         assert!(parse_args(["wtr", "a", "--icon-width", "3"]).is_err());
         assert!(parse_args(["wtr", "a", "--icon-width", "0"]).is_err());
+    }
+
+    #[test]
+    fn scan_records_subcommand() {
+        assert_eq!(
+            parse_args(["wtr", "scan-records", "/p"]).unwrap(),
+            Command::ScanRecords(vec![PathBuf::from("/p")])
+        );
+        assert_eq!(
+            parse_args(["wtr", "scan-records"]).unwrap(),
+            Command::ScanRecords(vec![])
+        );
     }
 }

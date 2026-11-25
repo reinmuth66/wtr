@@ -130,7 +130,7 @@
 #### 読み方
 
 - jsonl の形は公式には定義されていない。Claude Code の資料 (`sessions.md` の「Where transcripts are stored」) は「形は内部のもので版ごとに変わり、直接読むスクリプトはどの版でも壊れうる」としている。実際に新しい種類の記録が版ごとに増えている (下の「形の変化の追い方」)
-- そのため、知っている形の記録だけを拾い、知らない `type`、`subtype`、`attachment.type` と、読めない欄は黙って捨てる。捨てても落ちない、行が崩れない、を守る。知らない種類を見る手段として、捨てた種類を数えて出す起動の印 (`--debug-unknown` など。名前は作る人に任せる) を持つ
+- そのため、知っている形の記録だけを拾い、知らない `type`、`subtype`、`attachment.type` と、読めない欄は黙って捨てる。捨てても落ちない、行が崩れない、を守る。知らない種類を見る手段として、`wtr scan-records <jsonl>` に 1 つのファイルを渡して数える (2026-11-25 の判断。同じ集計を 2 か所に持たないため)
 - 確かめた版: Claude Code 2.1.311〜2.1.326 の記録 (2026-11-23)。試験の材料は実際の記録から作り、版が上がって壊れたら材料を足して直す
 - 記録の種類の表 (`type`、`subtype`、`attachment.type`、`message.content[].type` の組)。1 か所にまとめ、「使う」と「捨てる」のどちらかに必ず入れる。どちらにも無いものが「知らない種類」になる。初めの中身 (2026-11-23 に手元の 2.1.296〜2.1.326 の記録にあった種類から作った):
   - 使う: `assistant` (中身の `tool_use`。`text`、`thinking` は捨てる)、`user` (中身の `text`、`image`、`tool_result`)、`system:compact_boundary`、`system:local_command`、`attachment:queued_command`、`attachment:hook_success`、`attachment:hook_non_blocking_error`、`attachment:hook_blocking_error` (手元の記録には無いが、Claude Code の hook の仕組みにある)、`attachment:hook_cancelled` (hook の出力と同じ場所に `─ hook · cancelled ─` として出す)、`attachment:diagnostics` (編集後の LSP の指摘)、`system:turn_duration` (作業時間)
@@ -140,7 +140,22 @@
 - 「捨てる」は「Claude Code の画面に出ない」という意味ではない。`away_summary` (離れていた間のまとめ、recap)、`informational` (お知らせ)、`plan_mode` などは Claude Code の画面に出るが、`wtr` の 3 つの行 (道具の呼び出し、指示、要約の区切り) に当たらないので捨てる
 - 知らない種類も画面には出さない (数えるだけ)
 - 知らない種類を Issue にする仕組み (段階 2 で作る):
-  - `wtr scan-records` (名前は作る人に任せる): `~/.claude/projects` の jsonl を読み、知らない種類ごとに、件数、初めて現れた `version`、出てきた欄の名前 (キーだけ) を JSON で標準出力に出す。既に知っている種類で、使っている欄 (`toolUseResult.structuredPatch`、`compactMetadata.preTokens` など) が無くなったことも出す。`wtr` は結果を出すだけで、gh は呼ばない (設計者の判断。gh の有無や認証、重複の確かめを `wtr` に持たせないため)。出力の JSON の形は dotfiles との約束として設計書か README に書く
+  - `wtr scan-records [PATH]...`: 引数が無ければ `~/.claude/projects` の jsonl を読み、知らない種類ごとに、件数、初めて現れた `version`、出てきた欄の名前 (キーだけ) を 1 行の JSON で標準出力に出す。既に知っている種類で、使っている欄 (`toolUseResult.structuredPatch`、`compactMetadata.preTokens` など) が無くなったことも出す。`wtr` は結果を出すだけで、gh は呼ばない (設計者の判断。gh の有無や認証、重複の確かめを `wtr` に持たせないため)。出力の JSON の形 (dotfiles との約束):
+    ```json
+    {
+      "files": 120,
+      "records": 45678,
+      "unknown": [
+        { "kind": "attachment:brand_new", "count": 3, "first_version": "2.1.330", "fields": ["prompt", "type"] }
+      ],
+      "missing_fields": [
+        { "kind": "tool:Edit", "field": "/toolUseResult/structuredPatch", "count": 2, "last_version": "2.1.331" }
+      ]
+    }
+    ```
+    - `files`: 読んだ jsonl ファイルの数、`records`: 読めた記録 (行) の数
+    - `unknown`: `classify` が `Unknown` の種類 (記録の種類と、`assistant` / `user` の中身の種類)。`count`: 件数、`first_version`: 記録の `version` の一番小さいもの (無ければ `null`)、`fields`: 記録の種類なら記録の欄、`attachment:` なら `attachment` の欄、中身の種類なら中身の要素の欄の、名前の和集合 (値は出さない)。`kind` の順
+    - `missing_fields`: `FIELDS` の種類に当たる記録で、その JSON Pointer が無いもの (`tool:<名前>` は同じファイルの `tool_use` の id から名前を引き、`toolUseResult` が物の `user` の記録だけを見る)。`count`: 件数、`last_version`: 無かった記録の `version` の一番大きいもの (無ければ `null`)
   - dotfiles の nix で launchd の仕事を作り、1 日 1 回 `wtr scan-records` を動かす。dotfiles のスクリプトが結果を読み、知らない種類があれば `gh issue create` で `reinmuth66/wtr` (private) に出す。題名に種類の名前を入れ、同じ題名で開いている Issue があれば出さない
   - Issue の本文には種類の名前、版、欄の名前だけを書き、記録の中身 (指示の文、コマンド、ファイルの中身) は書かない。GitHub に会話の中身を出さないため
   - TUI からは Issue を出さない (常駐の画面から勝手にネットへ書かないため)

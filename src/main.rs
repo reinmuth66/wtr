@@ -48,8 +48,16 @@ const HL_BUDGET: Duration = Duration::from_millis(8);
 fn main() -> anyhow::Result<()> {
     let view = match parse_args(std::env::args_os()) {
         Ok(Command::View(v)) => v,
-        Ok(Command::ScanRecords(_)) => {
-            eprintln!("scan-records: not built yet");
+        Ok(Command::ScanRecords(paths)) => {
+            let roots = if paths.is_empty() {
+                std::env::var_os("HOME")
+                    .map(|h| vec![PathBuf::from(h).join(".claude/projects")])
+                    .unwrap_or_default()
+            } else {
+                paths
+            };
+            let files = wtr::scan::jsonl_files(&roots);
+            println!("{}", wtr::scan::scan(&files));
             return Ok(());
         }
         Err(e) => e.exit(),

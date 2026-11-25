@@ -683,7 +683,8 @@ pub fn render_compact(
         cur_x = nx;
     }
 
-    let (fill_end, draw_right) = if right_w > 0 && (end_x - x) as usize > right_w + 6 {
+    let (fill_end, draw_right) = if right_w > 0 && (cur_x as usize) + 1 + right_w <= end_x as usize
+    {
         (end_x - right_w as u16, true)
     } else {
         (end_x, false)
@@ -955,6 +956,28 @@ mod tests {
         assert!(line.contains("compacted · manual"));
         assert!(line.contains("630k → 10k"));
         assert_eq!(buf[(59, 0)].symbol(), "k");
+    }
+
+    #[test]
+    fn compact_line_width_30_omits_overlapping_tokens() {
+        let compact = CompactRow {
+            manual: true,
+            pre_tokens: Some(630_000),
+            post_tokens: Some(10_000),
+            summary: None,
+        };
+        let mut buf = Buffer::empty(Rect::new(0, 0, 30, 1));
+        render_compact(&mut buf, 0, 0, 30, &compact, 1);
+        let line = buf_line(&buf, 0, 30);
+        assert!(
+            line.contains("compacted · manual"),
+            "expected label intact in {line:?}"
+        );
+        assert!(
+            line.width() <= 30,
+            "expected width <= 30, got {} in {line:?}",
+            line.width()
+        );
     }
 
     #[test]

@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::path::PathBuf;
 
@@ -587,7 +588,7 @@ impl History {
             let Some(uri) = file.get("uri").and_then(Value::as_str) else {
                 continue;
             };
-            let path = uri.strip_prefix("file://").unwrap_or(uri);
+            let path = uri_to_path(uri);
             let Some(diags) = file.get("diagnostics").and_then(Value::as_array) else {
                 continue;
             };
@@ -600,7 +601,8 @@ impl History {
                         r,
                         Row::Tool(t)
                             if (t.name == "Edit" || t.name == "Write")
-                                && t.input.get("file_path").and_then(Value::as_str) == Some(path)
+                                && t.input.get("file_path").and_then(Value::as_str)
+                                    == Some(path.as_ref())
                     )
                 })
             else {
@@ -633,6 +635,44 @@ impl History {
             }
             self.bump(idx);
         }
+    }
+}
+
+fn uri_to_path(uri: &str) -> Cow<'_, str> {
+    let Some(rest) = uri.strip_prefix("file://") else {
+        return Cow::Borrowed(uri);
+    };
+    percent_decode(rest)
+}
+
+fn percent_decode(s: &str) -> Cow<'_, str> {
+    if !s.as_bytes().contains(&b'%') {
+        return Cow::Borrowed(s);
+    }
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%'
+            && i + 2 < bytes.len()
+            && let (Some(hi), Some(lo)) = (hex_val(bytes[i + 1]), hex_val(bytes[i + 2]))
+        {
+            out.push((hi << 4) | lo);
+            i += 3;
+            continue;
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    Cow::Owned(String::from_utf8_lossy(&out).into_owned())
+}
+
+fn hex_val(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
     }
 }
 
@@ -1394,5 +1434,41 @@ mod tests {
             "<agent-message from=\"a3\">\nnot a hand-back\n</agent-message>",
         ));
         assert_eq!(h.rows.len(), 1);
+    }
+
+    #[test]
+    fn diagnostics_decode_percent_encoded_file_uri() {
+        let mut h = History::new();
+        h.push(&tool_use(
+            "e1",
+            "Edit",
+            json!({ "file_path": "/p/My Project/日本.rs" }),
+        ));
+        h.push(&attachment(
+            "diagnostics",
+            json!({
+                "files": [
+                    {
+                        "uri": "file:///p/My%20Project/%E6%97%A5%E6%9C%AC.rs",
+                        "diagnostics": [
+                            { "severity": "Error", "range": { "start": { "line": 2 } }, "message": "boom" }
+                        ]
+                    }
+                ]
+            }),
+        ));
+        match &h.rows[0] {
+            Row::Tool(t) => {
+                assert_eq!(
+                    t.diagnostics,
+                    vec![Diagnostic {
+                        severity: Severity::Error,
+                        line: 3,
+                        message: "boom".to_string(),
+                    }]
+                );
+            }
+            _ => panic!("expected Tool row"),
+        }
     }
 }

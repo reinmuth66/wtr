@@ -86,30 +86,35 @@ impl<R: Run> Controller<R> {
             .filter(|(k, id)| *k == key && ids.contains(id))
             .map(|(_, id)| *id);
 
-        if let Some(id) = existing {
+        let result = if let Some(id) = existing {
             let id_str = id.to_string();
-            self.run.run(&str_args(&[
-                "action",
-                "--browser",
-                &key,
-                "--tab",
-                &id_str,
-                "--follow",
-                "--",
-                "goto",
-                url,
-            ]))?;
+            self.run
+                .run(&str_args(&[
+                    "action",
+                    "--browser",
+                    &key,
+                    "--tab",
+                    &id_str,
+                    "--follow",
+                    "--",
+                    "goto",
+                    url,
+                ]))
+                .map(|_| ())
         } else {
-            let reply =
-                self.run
-                    .run(&str_args(&["action", "--browser", &key, "--", "open", url]))?;
-            if let Some(id) = parse_opened_tab(&reply) {
-                self.tabs.insert(tab, (key.clone(), id));
-            }
-        }
+            self.run
+                .run(&str_args(&["action", "--browser", &key, "--", "open", url]))
+                .map(|reply| {
+                    if let Some(id) = parse_opened_tab(&reply) {
+                        self.tabs.insert(tab, (key.clone(), id));
+                    }
+                })
+        };
 
-        self.run
-            .run(&str_args(&["action", "--browser", &key, "done"]))?;
+        let _ = self
+            .run
+            .run(&str_args(&["action", "--browser", &key, "done"]));
+        result?;
 
         if let Some(cmd) = &self.on_browse {
             run_on_browse(cmd)?;
@@ -431,6 +436,27 @@ mod tests {
         assert_eq!(
             ctrl.open(None, "file:///x.html").unwrap_err(),
             "on-browse exit 3"
+        );
+    }
+
+    #[test]
+    fn goto_error_still_calls_done_and_returns_err() {
+        let fake = Fake::new([
+            Ok(LS),
+            Ok(r#"{"openedTab":5}"#),
+            Ok("{}"),
+            Ok(LS_WITH_5),
+            Err("tab loading"),
+            Ok("{}"),
+        ]);
+        let mut ctrl = Controller::new(fake, None);
+        ctrl.open(None, "file:///x.html").unwrap();
+        ctrl.run.calls.clear();
+        let err = ctrl.open(None, "https://e").unwrap_err();
+        assert_eq!(err, "tab loading");
+        assert_eq!(
+            ctrl.run.calls.last().unwrap(),
+            &vec!["action", "--browser", "9-1", "done"]
         );
     }
 }

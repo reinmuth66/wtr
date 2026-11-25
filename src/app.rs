@@ -3,7 +3,10 @@
 //! `App` never touches the terminal. It is driven by events and answers with
 //! `Action`s for the main loop to carry out.
 
+mod history_pane;
+
 use std::collections::HashMap;
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -11,13 +14,18 @@ use image::DynamicImage;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::text::Line;
 
+use crate::browser::{file_url, is_html};
 use crate::highlight::{Highlighter, HlCache};
 use crate::kind::FileKind;
 use crate::loader::{Content, Loaded};
+use crate::nav::{HistoryView, Nav, NavKey};
+use crate::row_text::Ctx;
 use crate::state::{Target, parse_state, resolve_target};
+use crate::tail::SessionRead;
 use crate::text_doc::TextDoc;
 use crate::view::{DocRows, text_width};
 use crate::wrap::{Rows, Scroll, clamp, scroll_bottom, scroll_down, scroll_up};
+use history_pane::HistoryPane;
 
 /// The longest a load may block to color the lines on screen.
 const CATCH_UP: Duration = Duration::from_millis(100);
@@ -47,6 +55,13 @@ pub struct Shown {
     pub scroll: Scroll,
 }
 
+/// Which view is currently shown for a tab.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Pane {
+    File,
+    History,
+}
+
 #[derive(Debug, PartialEq)]
 pub enum Action {
     None,
@@ -54,19 +69,41 @@ pub enum Action {
         path: PathBuf,
         generation: u64,
     },
+    ReadSession {
+        path: PathBuf,
+        offset: u64,
+        generation: u64,
+    },
     Open {
         path: PathBuf,
-        kind: FileKind,
+        kind: Option<FileKind>,
         alt: bool,
     },
+    Browse {
+        url: String,
+    },
+    Redraw,
     Quit,
 }
 
 /// What one tab remembers.
-#[derive(Default)]
 struct TabState {
     /// The position of every file seen in this tab.
     scrolls: HashMap<PathBuf, Scroll>,
+    pane: Pane,
+    nav: Nav,
+    session: Option<PathBuf>,
+}
+
+impl Default for TabState {
+    fn default() -> Self {
+        Self {
+            scrolls: HashMap::new(),
+            pane: Pane::File,
+            nav: Nav::default(),
+            session: None,
+        }
+    }
 }
 
 /// A load that has been requested and not yet arrived.
@@ -111,6 +148,8 @@ fn move_scroll(body: &Body, vp: Viewport, s: Scroll, mv: Move) -> Scroll {
 
 pub struct App {
     hl: Highlighter,
+    ctx: Ctx,
+    path_var: Option<OsString>,
     shown: Option<Shown>,
     /// The tab `shown` belongs to.
     shown_tab: Option<String>,
@@ -122,6 +161,7 @@ pub struct App {
     /// watched so that it shows up once created.
     missing: Option<(PathBuf, Option<String>)>,
     generation: u64,
+    history: HistoryPane,
     /// A message and when it was set.
     message: Option<(String, Instant)>,
     /// The previous key was `g`.
@@ -129,9 +169,11 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(hl: Highlighter) -> Self {
+    pub fn new(hl: Highlighter, ctx: Ctx, path_var: Option<OsString>) -> Self {
         Self {
             hl,
+            ctx,
+            path_var,
             shown: None,
             shown_tab: None,
             tab: None,
@@ -139,6 +181,7 @@ impl App {
             pending: None,
             missing: None,
             generation: 0,
+            history: HistoryPane::new(),
             message: None,
             g_pressed: false,
         }
@@ -146,6 +189,34 @@ impl App {
 
     pub fn shown(&self) -> Option<&Shown> {
         self.shown.as_ref()
+    }
+
+    pub fn pane(&self) -> Pane {
+        self.tabs.get(&self.tab).map_or(Pane::File, |t| t.pane)
+    }
+
+    pub fn tab(&self) -> Option<String> {
+        self.tab.clone()
+    }
+
+    pub fn watched_session(&self) -> Option<&Path> {
+        self.history.watched()
+    }
+
+    pub fn history_view(&mut self, vp: Viewport) -> Option<HistoryView<'_>> {
+        let tab = self.tabs.entry(self.tab.clone()).or_default();
+        self.history.view(
+            &mut tab.nav,
+            vp,
+            &self.ctx,
+            &self.hl,
+            self.path_var.as_deref(),
+        )
+    }
+
+    #[cfg(test)]
+    fn detail_builds(&self) -> usize {
+        self.history.detail_builds()
     }
 
     pub fn message(&self) -> Option<&str> {
@@ -198,12 +269,36 @@ impl App {
         }
     }
 
-    pub fn on_state_bytes(&mut self, bytes: &[u8]) -> Action {
+    pub fn on_state_bytes(&mut self, bytes: &[u8]) -> Vec<Action> {
         let Some(state) = parse_state(bytes) else {
-            return Action::None;
+            return Vec::new();
         };
+        let mut actions = Vec::new();
         self.tab = state.tab;
-        match resolve_target(state.file.as_deref()) {
+        if let Some(tab_state) = self.tabs.get_mut(&self.tab) {
+            if tab_state.session != state.session {
+                tab_state.session = state.session.clone();
+                tab_state.nav = Nav::default();
+            }
+        } else {
+            self.tabs.insert(
+                self.tab.clone(),
+                TabState {
+                    scrolls: HashMap::new(),
+                    pane: if state.session.is_some() {
+                        Pane::History
+                    } else {
+                        Pane::File
+                    },
+                    nav: Nav::default(),
+                    session: state.session.clone(),
+                },
+            );
+        }
+        if let Some(act) = self.history.set_session(state.session) {
+            actions.push(act);
+        }
+        let file_action = match resolve_target(state.file.as_deref()) {
             Target::Keep => Action::None,
             Target::Missing => {
                 self.remember();
@@ -222,13 +317,23 @@ impl App {
                     (None, None) => None,
                 };
                 if current == Some((&self.tab, p.as_path())) {
-                    return Action::None;
+                    Action::None
+                } else {
+                    self.remember();
+                    let tab = self.tab.clone();
+                    self.load_in_tab(p, tab)
                 }
-                self.remember();
-                let tab = self.tab.clone();
-                self.load_in_tab(p, tab)
             }
+        };
+        if file_action != Action::None {
+            actions.push(file_action);
         }
+        actions
+    }
+
+    pub fn on_session_read(&mut self, r: SessionRead, vp: Viewport) -> Action {
+        let tab = self.tabs.entry(self.tab.clone()).or_default();
+        self.history.on_read(r, &mut tab.nav, vp)
     }
 
     /// Loads `path` for `tab`, starting where that tab last left it.
@@ -281,28 +386,38 @@ impl App {
     }
 
     /// The file `path` changed on disk.
-    pub fn on_fs_change(&mut self, path: &Path) -> Action {
-        if let Some(p) = &self.pending {
+    pub fn on_fs_change(&mut self, path: &Path) -> Vec<Action> {
+        let mut actions = Vec::new();
+        let file_action = if let Some(p) = &self.pending {
             // A load is on its way; reload only that file, keeping where it
             // is meant to start.
-            if p.path != path {
-                return Action::None;
+            if p.path == path {
+                let (path, tab, pos) = (p.path.clone(), p.tab.clone(), p.pos);
+                self.request_load(path, tab, pos)
+            } else {
+                Action::None
             }
-            let (path, tab, pos) = (p.path.clone(), p.tab.clone(), p.pos);
-            return self.request_load(path, tab, pos);
+        } else {
+            match (&self.shown, &self.missing) {
+                (Some(s), _) if s.path == path => {
+                    let (path, tab) = (s.path.clone(), self.shown_tab.clone());
+                    self.request_load(path, tab, None)
+                }
+                // The named file appeared: show it as the state asked.
+                (None, Some((m, tab))) if m == path => {
+                    let (path, tab) = (m.clone(), tab.clone());
+                    self.load_in_tab(path, tab)
+                }
+                _ => Action::None,
+            }
+        };
+        if file_action != Action::None {
+            actions.push(file_action);
         }
-        match (&self.shown, &self.missing) {
-            (Some(s), _) if s.path == path => {
-                let (path, tab) = (s.path.clone(), self.shown_tab.clone());
-                self.request_load(path, tab, None)
-            }
-            // The named file appeared: show it as the state asked.
-            (None, Some((m, tab))) if m == path => {
-                let (path, tab) = (m.clone(), tab.clone());
-                self.load_in_tab(path, tab)
-            }
-            _ => Action::None,
+        if let Some(act) = self.history.on_fs_change(path) {
+            actions.push(act);
         }
+        actions
     }
 
     pub fn on_key(&mut self, key: KeyEvent, vp: Viewport) -> Action {
@@ -315,8 +430,14 @@ impl App {
         let half = ((vp.height / 2) as usize).max(1);
         if ctrl {
             return match key.code {
-                KeyCode::Char('d') => self.scroll(vp, Move::Down(half)),
-                KeyCode::Char('u') => self.scroll(vp, Move::Up(half)),
+                KeyCode::Char('d') => match self.pane() {
+                    Pane::File => self.scroll(vp, Move::Down(half)),
+                    Pane::History => self.history_nav(NavKey::HalfDown, vp),
+                },
+                KeyCode::Char('u') => match self.pane() {
+                    Pane::File => self.scroll(vp, Move::Up(half)),
+                    Pane::History => self.history_nav(NavKey::HalfUp, vp),
+                },
                 KeyCode::Char('c') => Action::Quit,
                 _ => Action::None,
             };
@@ -324,22 +445,65 @@ impl App {
         if key.modifiers.contains(KeyModifiers::ALT) {
             return Action::None;
         }
-        match key.code {
-            KeyCode::Char('j') | KeyCode::Down => self.scroll(vp, Move::Down(1)),
-            KeyCode::Char('k') | KeyCode::Up => self.scroll(vp, Move::Up(1)),
-            KeyCode::Char('g') => {
-                if g_before {
-                    self.scroll(vp, Move::Top)
-                } else {
-                    self.g_pressed = true;
-                    Action::None
-                }
-            }
-            KeyCode::Char('G') => self.scroll(vp, Move::Bottom),
-            KeyCode::Char('o') | KeyCode::Enter => self.open(false),
-            KeyCode::Char('O') => self.open(true),
-            _ => Action::None,
+        if key.code == KeyCode::Tab {
+            let tab = self.tabs.entry(self.tab.clone()).or_default();
+            tab.pane = match tab.pane {
+                Pane::File => Pane::History,
+                Pane::History => Pane::File,
+            };
+            return Action::Redraw;
         }
+        match self.pane() {
+            Pane::File => match key.code {
+                KeyCode::Char('j') | KeyCode::Down => self.scroll(vp, Move::Down(1)),
+                KeyCode::Char('k') | KeyCode::Up => self.scroll(vp, Move::Up(1)),
+                KeyCode::Char('g') => {
+                    if g_before {
+                        self.scroll(vp, Move::Top)
+                    } else {
+                        self.g_pressed = true;
+                        Action::None
+                    }
+                }
+                KeyCode::Char('G') => self.scroll(vp, Move::Bottom),
+                KeyCode::Char('o') | KeyCode::Enter => self.open_file(false),
+                KeyCode::Char('O') => self.open_file(true),
+                _ => Action::None,
+            },
+            Pane::History => match key.code {
+                KeyCode::Char('j') | KeyCode::Down => self.history_nav(NavKey::Down, vp),
+                KeyCode::Char('k') | KeyCode::Up => self.history_nav(NavKey::Up, vp),
+                KeyCode::Char('l') | KeyCode::Right => self.history_nav(NavKey::Expand, vp),
+                KeyCode::Char('h') | KeyCode::Left => self.history_nav(NavKey::Collapse, vp),
+                KeyCode::Char('{') => self.history_nav(NavKey::PrevPrompt, vp),
+                KeyCode::Char('}') => self.history_nav(NavKey::NextPrompt, vp),
+                KeyCode::Char('g') => {
+                    if g_before {
+                        self.history_nav(NavKey::Top, vp)
+                    } else {
+                        self.g_pressed = true;
+                        Action::None
+                    }
+                }
+                KeyCode::Char('G') => self.history_nav(NavKey::Bottom, vp),
+                KeyCode::Char('o') | KeyCode::Enter => self.open_history(false),
+                KeyCode::Char('O') => self.open_history(true),
+                _ => Action::None,
+            },
+        }
+    }
+
+    fn history_nav(&mut self, key: NavKey, vp: Viewport) -> Action {
+        let tab = self.tabs.entry(self.tab.clone()).or_default();
+        self.history.apply_nav(
+            key,
+            &mut tab.nav,
+            vp,
+            &self.ctx,
+            &self.hl,
+            self.path_var.as_deref(),
+        );
+        Action::None
     }
 
     fn scroll(&mut self, vp: Viewport, mv: Move) -> Action {
@@ -349,15 +513,23 @@ impl App {
         Action::None
     }
 
-    fn open(&self, alt: bool) -> Action {
+    fn open_file(&self, alt: bool) -> Action {
         match &self.shown {
+            Some(s) if alt && is_html(&s.path) => Action::Browse {
+                url: file_url(&s.path),
+            },
             Some(s) => Action::Open {
                 path: s.path.clone(),
-                kind: s.kind,
+                kind: Some(s.kind),
                 alt,
             },
             None => Action::None,
         }
+    }
+
+    fn open_history(&self, alt: bool) -> Action {
+        let nav = self.tabs.get(&self.tab).map(|t| t.nav).unwrap_or_default();
+        self.history.open(&nav, alt)
     }
 
     /// Highlights a little more of the shown text. Returns true while lines
@@ -427,14 +599,29 @@ mod tests {
     }
 
     fn new_app() -> App {
-        App::new(Highlighter::new())
+        App::new(
+            Highlighter::new(),
+            Ctx {
+                home: None,
+                icon_width: 1,
+            },
+            None,
+        )
+    }
+
+    fn take_load(actions: Vec<Action>) -> (PathBuf, u64) {
+        actions
+            .into_iter()
+            .find_map(|a| match a {
+                Action::Load { path, generation } => Some((path, generation)),
+                _ => None,
+            })
+            .expect("expected Load")
     }
 
     /// Sends the state, expects a `Load`, and answers it with `n` lines.
     fn show(app: &mut App, tab: Option<&str>, file: &Path, n: usize) {
-        let Action::Load { path, generation } = app.on_state_bytes(&state(tab, file)) else {
-            panic!("expected Load for {file:?}");
-        };
+        let (path, generation) = take_load(app.on_state_bytes(&state(tab, file)));
         assert_eq!(path, file);
         assert!(app.on_loaded(text_loaded(&path, generation, n), VP));
     }
@@ -452,7 +639,7 @@ mod tests {
     #[test]
     fn broken_state_changes_nothing() {
         let mut a = new_app();
-        assert_eq!(a.on_state_bytes(b"{\"fi"), Action::None);
+        assert!(a.on_state_bytes(b"{\"fi").is_empty());
         assert!(a.shown().is_none());
         assert!(a.watched_file().is_none());
     }
@@ -563,7 +750,7 @@ mod tests {
         show(&mut a, Some("2"), &f[0], 100);
         assert_eq!(line(&a), 0);
         // Same tab, same file: nothing to load.
-        assert_eq!(a.on_state_bytes(&state(Some("2"), &f[0])), Action::None);
+        assert!(a.on_state_bytes(&state(Some("2"), &f[0])).is_empty());
     }
 
     #[test]
@@ -575,10 +762,7 @@ mod tests {
         press(&mut a, &['j'; 20]);
         assert_eq!(line(&a), 20);
         // A folder without README keeps f1 on screen, but the tab moves on.
-        assert_eq!(
-            a.on_state_bytes(&state(Some("2"), empty.path())),
-            Action::None
-        );
+        assert!(a.on_state_bytes(&state(Some("2"), empty.path())).is_empty());
         assert_eq!(a.shown().unwrap().path, f[0]);
         // f1 from tab 2 is a new view: it loads and starts at the top.
         show(&mut a, Some("2"), &f[0], 100);
@@ -595,12 +779,8 @@ mod tests {
     fn stale_generation_is_dropped() {
         let (_d, f) = files(2);
         let mut a = new_app();
-        let Action::Load { generation: g1, .. } = a.on_state_bytes(&state(Some("1"), &f[0])) else {
-            panic!("expected Load");
-        };
-        let Action::Load { generation: g2, .. } = a.on_state_bytes(&state(Some("1"), &f[1])) else {
-            panic!("expected Load");
-        };
+        let (_, g1) = take_load(a.on_state_bytes(&state(Some("1"), &f[0])));
+        let (_, g2) = take_load(a.on_state_bytes(&state(Some("1"), &f[1])));
         assert_eq!(g2, g1 + 1);
         assert_eq!(a.watched_file(), Some(f[1].as_path()));
         assert!(!a.on_loaded(text_loaded(&f[0], g1, 10), VP));
@@ -616,9 +796,7 @@ mod tests {
         show(&mut a, Some("1"), &f[0], 100);
         press(&mut a, &['j'; 50]);
         assert_eq!(line(&a), 50);
-        let Action::Load { path, generation } = a.on_fs_change(&f[0]) else {
-            panic!("expected Load");
-        };
+        let (path, generation) = take_load(a.on_fs_change(&f[0]));
         assert_eq!(path, f[0]);
         // The old display stays while loading.
         assert_eq!(line(&a), 50);
@@ -629,9 +807,7 @@ mod tests {
         let mut a = new_app();
         show(&mut a, Some("1"), &f[0], 100);
         press(&mut a, &['j'; 50]);
-        let Action::Load { path, generation } = a.on_fs_change(&f[0]) else {
-            panic!("expected Load");
-        };
+        let (path, generation) = take_load(a.on_fs_change(&f[0]));
         assert!(a.on_loaded(text_loaded(&path, generation, 100), VP));
         assert_eq!(line(&a), 50);
     }
@@ -658,17 +834,13 @@ mod tests {
             (scroll.line..scroll.line + VP.height as usize).all(|i| hl.line(i).is_some())
         };
         let mut a = new_app();
-        let Action::Load { path, generation } = a.on_state_bytes(&state(Some("1"), &f[0])) else {
-            panic!("expected Load");
-        };
+        let (path, generation) = take_load(a.on_state_bytes(&state(Some("1"), &f[0])));
         assert!(a.on_loaded(colored(&path, generation), VP));
         for _ in 0..200 {
             a.on_key(ctrl('d'), VP);
         }
         assert_eq!(line(&a), 1000);
-        let Action::Load { path, generation } = a.on_fs_change(&f[0]) else {
-            panic!("expected Load");
-        };
+        let (path, generation) = take_load(a.on_fs_change(&f[0]));
         assert!(a.on_loaded(colored(&path, generation), VP));
         assert_eq!(line(&a), 1000);
         assert!(
@@ -682,9 +854,7 @@ mod tests {
         let (_d, f) = files(1);
         let mut a = new_app();
         show(&mut a, Some("1"), &f[0], 10);
-        let Action::Load { generation, .. } = a.on_fs_change(&f[0]) else {
-            panic!("expected Load");
-        };
+        let (_, generation) = take_load(a.on_fs_change(&f[0]));
         let missing = Loaded {
             generation,
             path: f[0].clone(),
@@ -695,13 +865,11 @@ mod tests {
         assert!(matches!(a.shown().unwrap().body, Body::Missing));
         assert_eq!(a.watched_file(), Some(f[0].as_path()));
         // It comes back: a change event loads it again.
-        let Action::Load { path, generation } = a.on_fs_change(&f[0]) else {
-            panic!("expected Load");
-        };
+        let (path, generation) = take_load(a.on_fs_change(&f[0]));
         assert!(a.on_loaded(text_loaded(&path, generation, 10), VP));
         assert!(matches!(a.shown().unwrap().body, Body::Text { .. }));
         // Other paths are none of its business.
-        assert_eq!(a.on_fs_change(Path::new("/other")), Action::None);
+        assert!(a.on_fs_change(Path::new("/other")).is_empty());
     }
 
     #[test]
@@ -710,12 +878,12 @@ mod tests {
         let mut a = new_app();
         show(&mut a, Some("1"), &f[0], 10);
         let bytes = serde_json::to_vec(&serde_json::json!({"file": "/no/such"})).unwrap();
-        assert_eq!(a.on_state_bytes(&bytes), Action::None);
+        assert!(a.on_state_bytes(&bytes).is_empty());
         assert!(a.shown().is_none());
         // Still watched, so it shows up once it is created.
         assert_eq!(a.watched_file(), Some(Path::new("/no/such")));
         // A state without a file has nothing to watch.
-        assert_eq!(a.on_state_bytes(b"{}"), Action::None);
+        assert!(a.on_state_bytes(b"{}").is_empty());
         assert!(a.watched_file().is_none());
     }
 
@@ -728,14 +896,12 @@ mod tests {
         press(&mut a, &['j'; 7]);
         show(&mut a, Some("2"), &f[0], 100);
         // Tab 1 now points at a file that does not exist yet.
-        assert_eq!(a.on_state_bytes(&state(Some("1"), &later)), Action::None);
+        assert!(a.on_state_bytes(&state(Some("1"), &later)).is_empty());
         assert!(a.shown().is_none());
         assert_eq!(a.watched_file(), Some(later.as_path()));
-        assert_eq!(a.on_fs_change(&f[0]), Action::None);
+        assert!(a.on_fs_change(&f[0]).is_empty());
         std::fs::write(&later, "x").unwrap();
-        let Action::Load { path, generation } = a.on_fs_change(&later) else {
-            panic!("expected Load");
-        };
+        let (path, generation) = take_load(a.on_fs_change(&later));
         assert_eq!(path, later);
         assert!(a.on_loaded(text_loaded(&path, generation, 100), VP));
         assert_eq!(a.shown().unwrap().path, later);
@@ -751,10 +917,7 @@ mod tests {
         let empty = tempfile::tempdir().unwrap();
         let mut a = new_app();
         show(&mut a, Some("1"), &f[0], 10);
-        assert_eq!(
-            a.on_state_bytes(&state(Some("1"), empty.path())),
-            Action::None
-        );
+        assert!(a.on_state_bytes(&state(Some("1"), empty.path())).is_empty());
         assert_eq!(a.shown().unwrap().path, f[0]);
     }
 
@@ -766,7 +929,7 @@ mod tests {
         show(&mut a, Some("1"), &f[0], 10);
         let open = |alt| Action::Open {
             path: f[0].clone(),
-            kind: FileKind::Text,
+            kind: Some(FileKind::Text),
             alt,
         };
         assert_eq!(a.on_key(key('o'), VP), open(false));
@@ -786,14 +949,360 @@ mod tests {
             height: 0,
         };
         let mut a = new_app();
-        let Action::Load { path, generation } = a.on_state_bytes(&state(Some("1"), &f[0])) else {
-            panic!("expected Load");
-        };
+        let (path, generation) = take_load(a.on_state_bytes(&state(Some("1"), &f[0])));
         assert!(a.on_loaded(text_loaded(&path, generation, 100), zero));
         for k in [key('j'), ctrl('d'), key('G'), key('g'), key('g')] {
             a.on_key(k, zero);
         }
         a.on_key(key('G'), VP);
         assert_eq!(line(&a), 90);
+    }
+
+    fn state_with_session(
+        tab: Option<&str>,
+        file: Option<&Path>,
+        session: Option<&Path>,
+    ) -> Vec<u8> {
+        let mut map = serde_json::Map::new();
+        if let Some(t) = tab {
+            map.insert("tab".into(), serde_json::json!(t));
+        }
+        if let Some(f) = file {
+            map.insert("file".into(), serde_json::json!(f));
+        }
+        if let Some(s) = session {
+            map.insert("session".into(), serde_json::json!(s));
+        }
+        serde_json::to_vec(&serde_json::Value::Object(map)).unwrap()
+    }
+
+    fn tool_use_rec(id: &str, name: &str, input: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({
+            "type": "assistant",
+            "message": {
+                "role": "assistant",
+                "content": [
+                    { "type": "tool_use", "id": id, "name": name, "input": input }
+                ]
+            }
+        })
+    }
+
+    fn prompt_rec(text: &str) -> serde_json::Value {
+        serde_json::json!({
+            "type": "user",
+            "message": { "role": "user", "content": text }
+        })
+    }
+
+    #[test]
+    fn first_tab_with_session_starts_in_history() {
+        let (_d, f) = files(1);
+        let s = PathBuf::from("/tmp/s.jsonl");
+        let mut a = new_app();
+        let actions = a.on_state_bytes(&state_with_session(Some("1"), Some(&f[0]), Some(&s)));
+        assert_eq!(a.pane(), Pane::History);
+        assert!(actions.iter().any(|act| matches!(
+            act,
+            Action::ReadSession { path, offset: 0, .. } if path == &s
+        )));
+    }
+
+    #[test]
+    fn first_tab_without_session_starts_in_file() {
+        let (_d, f) = files(1);
+        let mut a = new_app();
+        let _ = a.on_state_bytes(&state_with_session(Some("1"), Some(&f[0]), None));
+        assert_eq!(a.pane(), Pane::File);
+    }
+
+    #[test]
+    fn tab_key_toggles_and_redraws() {
+        let (_d, f) = files(1);
+        let mut a = new_app();
+        let _ = a.on_state_bytes(&state_with_session(Some("1"), Some(&f[0]), None));
+        assert_eq!(a.pane(), Pane::File);
+        assert_eq!(
+            a.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE), VP),
+            Action::Redraw
+        );
+        assert_eq!(a.pane(), Pane::History);
+        assert_eq!(
+            a.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE), VP),
+            Action::Redraw
+        );
+        assert_eq!(a.pane(), Pane::File);
+    }
+
+    #[test]
+    fn session_change_in_the_same_tab_resets_the_selection() {
+        let s1 = PathBuf::from("/tmp/s1.jsonl");
+        let s2 = PathBuf::from("/tmp/s2.jsonl");
+        let mut a = new_app();
+        let actions = a.on_state_bytes(&state_with_session(Some("1"), None, Some(&s1)));
+        let gen1 = actions
+            .iter()
+            .find_map(|act| match act {
+                Action::ReadSession { generation, .. } => Some(*generation),
+                _ => None,
+            })
+            .unwrap();
+        let chunk = crate::tail::Chunk {
+            records: vec![prompt_rec("one"), prompt_rec("two"), prompt_rec("three")],
+            end: 100,
+            reset: false,
+        };
+        a.on_session_read(
+            crate::tail::SessionRead {
+                generation: gen1,
+                result: Ok(chunk),
+            },
+            VP,
+        );
+        a.on_key(key('k'), VP);
+        let v = a.history_view(VP).unwrap();
+        assert!(!v.nav.follow);
+        assert_eq!(v.nav.selected, 1);
+
+        let actions2 = a.on_state_bytes(&state_with_session(Some("1"), None, Some(&s2)));
+        assert!(actions2.iter().any(|act| matches!(
+            act,
+            Action::ReadSession { path, offset: 0, .. } if path == &s2
+        )));
+        let v2 = a.history_view(VP).unwrap();
+        assert!(v2.nav.follow);
+        assert_eq!(*v2.nav, crate::nav::Nav::default());
+    }
+
+    #[test]
+    fn appends_while_reading_are_read_again() {
+        let s = PathBuf::from("/tmp/s.jsonl");
+        let mut a = new_app();
+        let actions = a.on_state_bytes(&state_with_session(Some("1"), None, Some(&s)));
+        let gen1 = actions
+            .iter()
+            .find_map(|act| match act {
+                Action::ReadSession { generation, .. } => Some(*generation),
+                _ => None,
+            })
+            .unwrap();
+        // Change arrives while the first read is still in flight.
+        assert!(a.on_fs_change(&s).is_empty());
+        let next = a.on_session_read(
+            crate::tail::SessionRead {
+                generation: gen1,
+                result: Ok(crate::tail::Chunk {
+                    records: vec![prompt_rec("hi")],
+                    end: 42,
+                    reset: false,
+                }),
+            },
+            VP,
+        );
+        assert!(matches!(
+            next,
+            Action::ReadSession { path, offset: 42, .. } if path == s
+        ));
+    }
+
+    #[test]
+    fn stale_session_reads_are_dropped() {
+        let s1 = PathBuf::from("/tmp/s1.jsonl");
+        let s2 = PathBuf::from("/tmp/s2.jsonl");
+        let mut a = new_app();
+        let actions1 = a.on_state_bytes(&state_with_session(Some("1"), None, Some(&s1)));
+        let gen1 = actions1
+            .iter()
+            .find_map(|act| match act {
+                Action::ReadSession { generation, .. } => Some(*generation),
+                _ => None,
+            })
+            .unwrap();
+        let _ = a.on_state_bytes(&state_with_session(Some("1"), None, Some(&s2)));
+        let act = a.on_session_read(
+            crate::tail::SessionRead {
+                generation: gen1,
+                result: Ok(crate::tail::Chunk {
+                    records: vec![prompt_rec("stale")],
+                    end: 10,
+                    reset: false,
+                }),
+            },
+            VP,
+        );
+        assert_eq!(act, Action::None);
+        assert!(a.history_view(VP).unwrap().history.rows.is_empty());
+    }
+
+    #[test]
+    fn missing_session() {
+        let s = PathBuf::from("/tmp/missing.jsonl");
+        let mut a = new_app();
+        let actions = a.on_state_bytes(&state_with_session(Some("1"), None, Some(&s)));
+        let gen1 = actions
+            .iter()
+            .find_map(|act| match act {
+                Action::ReadSession { generation, .. } => Some(*generation),
+                _ => None,
+            })
+            .unwrap();
+        a.on_session_read(
+            crate::tail::SessionRead {
+                generation: gen1,
+                result: Err(std::io::Error::from(std::io::ErrorKind::NotFound)),
+            },
+            VP,
+        );
+        assert!(a.history_view(VP).is_none());
+    }
+
+    #[test]
+    fn opening_from_history() {
+        let s = PathBuf::from("/tmp/s.jsonl");
+        let mut a = new_app();
+        let actions = a.on_state_bytes(&state_with_session(Some("1"), None, Some(&s)));
+        let gen1 = actions
+            .iter()
+            .find_map(|act| match act {
+                Action::ReadSession { generation, .. } => Some(*generation),
+                _ => None,
+            })
+            .unwrap();
+        a.on_session_read(
+            crate::tail::SessionRead {
+                generation: gen1,
+                result: Ok(crate::tail::Chunk {
+                    records: vec![
+                        prompt_rec("hello"),
+                        tool_use_rec("t1", "Edit", serde_json::json!({"file_path": "/a/b.rs"})),
+                        tool_use_rec(
+                            "t2",
+                            "WebFetch",
+                            serde_json::json!({"url": "https://example.com"}),
+                        ),
+                    ],
+                    end: 100,
+                    reset: false,
+                }),
+            },
+            VP,
+        );
+        // Bottom row is WebFetch
+        assert_eq!(a.on_key(key('o'), VP), Action::None);
+        assert_eq!(
+            a.on_key(key('O'), VP),
+            Action::Browse {
+                url: "https://example.com".into()
+            }
+        );
+        // Move up to Edit
+        a.on_key(key('k'), VP);
+        assert_eq!(
+            a.on_key(key('o'), VP),
+            Action::Open {
+                path: PathBuf::from("/a/b.rs"),
+                kind: None,
+                alt: false,
+            }
+        );
+        // Move up to Prompt
+        a.on_key(key('k'), VP);
+        assert_eq!(a.on_key(key('o'), VP), Action::None);
+        assert_eq!(a.on_key(key('O'), VP), Action::None);
+    }
+
+    #[test]
+    fn html_goes_to_the_browser() {
+        let d = tempfile::tempdir().unwrap();
+        let html = d.path().join("a.html");
+        std::fs::write(&html, "<p>hi</p>").unwrap();
+        let mut a = new_app();
+        show(&mut a, Some("1"), &html, 1);
+        assert_eq!(
+            a.on_key(key('O'), VP),
+            Action::Browse {
+                url: crate::browser::file_url(&html),
+            }
+        );
+        assert_eq!(
+            a.on_key(key('o'), VP),
+            Action::Open {
+                path: html,
+                kind: Some(FileKind::Text),
+                alt: false,
+            }
+        );
+    }
+
+    #[test]
+    fn detail_is_built_once_per_revision() {
+        let s = PathBuf::from("/tmp/s.jsonl");
+        let mut a = new_app();
+        let actions = a.on_state_bytes(&state_with_session(Some("1"), None, Some(&s)));
+        let gen1 = actions
+            .iter()
+            .find_map(|act| match act {
+                Action::ReadSession { generation, .. } => Some(*generation),
+                _ => None,
+            })
+            .unwrap();
+        a.on_session_read(
+            crate::tail::SessionRead {
+                generation: gen1,
+                result: Ok(crate::tail::Chunk {
+                    records: vec![prompt_rec("hello world")],
+                    end: 50,
+                    reset: false,
+                }),
+            },
+            VP,
+        );
+        a.on_key(key('l'), VP);
+        let _ = a.history_view(VP).unwrap();
+        let builds1 = a.detail_builds();
+        let _ = a.history_view(VP).unwrap();
+        let builds2 = a.detail_builds();
+        assert_eq!(builds1, 1);
+        assert_eq!(builds2, 1);
+    }
+
+    #[test]
+    fn detail_scroll_is_clamped_after_resize() {
+        let s = PathBuf::from("/tmp/s.jsonl");
+        let mut a = new_app();
+        let actions = a.on_state_bytes(&state_with_session(Some("1"), None, Some(&s)));
+        let gen1 = actions
+            .iter()
+            .find_map(|act| match act {
+                Action::ReadSession { generation, .. } => Some(*generation),
+                _ => None,
+            })
+            .unwrap();
+        let text = (0..30)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        a.on_session_read(
+            crate::tail::SessionRead {
+                generation: gen1,
+                result: Ok(crate::tail::Chunk {
+                    records: vec![prompt_rec(&text)],
+                    end: 100,
+                    reset: false,
+                }),
+            },
+            VP,
+        );
+        a.on_key(key('l'), VP);
+        for _ in 0..20 {
+            a.on_key(ctrl('d'), VP);
+        }
+        assert!(a.history_view(VP).unwrap().nav.detail_scroll > 0);
+        // Resize to a tall viewport where all 30 lines fit.
+        let tall = Viewport {
+            width: 80,
+            height: 50,
+        };
+        assert_eq!(a.history_view(tall).unwrap().nav.detail_scroll, 0);
     }
 }

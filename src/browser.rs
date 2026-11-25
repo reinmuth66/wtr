@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::mpsc::{self, Sender};
 
 use serde_json::Value;
@@ -186,6 +186,9 @@ fn run_on_browse(cmd: &str) -> Result<(), String> {
     let status = Command::new("sh")
         .arg("-c")
         .arg(cmd)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
         .status()
         .map_err(|e| e.to_string())?;
     if !status.success() {

@@ -3,73 +3,109 @@ use notify::{RecommendedWatcher, RecursiveMode};
 use notify_debouncer_mini::{Debouncer, new_debouncer};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 pub const DEBOUNCE: Duration = Duration::from_millis(50);
 
-/// Resolve the parent folder (FSEvents reports `/private/var/...` for `/var/...`)
-/// and re-attach the file name. Falls back to the path as given.
+/// Resolve the nearest existing ancestor folder (FSEvents reports
+/// `/private/var/...` for `/var/...`) and re-attach the remaining suffix.
+/// Falls back to the path as given.
 pub fn normalize(p: &Path) -> PathBuf {
-    let (Some(parent), Some(name)) = (p.parent(), p.file_name()) else {
-        return p.to_path_buf();
-    };
-    match parent.canonicalize() {
-        Ok(parent) => parent.join(name),
-        Err(_) => p.to_path_buf(),
+    let mut cur = p.parent();
+    while let Some(ancestor) = cur {
+        if let Ok(canon) = ancestor.canonicalize()
+            && let Ok(rest) = p.strip_prefix(ancestor)
+        {
+            return canon.join(rest);
+        }
+        cur = ancestor.parent();
     }
+    p.to_path_buf()
 }
 
 /// Symlinks followed before giving up (a loop, or a very long chain).
 const MAX_LINKS: usize = 40;
 
-/// The real file behind `p`: symlinks are followed one at a time, with the
-/// parent normalized at each step. Unlike `canonicalize`, this still answers
-/// when the last target does not exist (yet), so a link whose target was
-/// deleted is still watched where the target will come back.
-pub fn link_target(p: &Path) -> PathBuf {
-    let mut p = normalize(p);
+/// Every hop from `normalize(p)` through symlinks followed one at a time,
+/// with the parent (or nearest existing ancestor) normalized at each step.
+pub fn link_chain(p: &Path) -> Vec<PathBuf> {
+    let mut cur = normalize(p);
+    let mut chain = vec![cur.clone()];
     for _ in 0..MAX_LINKS {
-        let Ok(t) = std::fs::read_link(&p) else { break };
-        let next = match p.parent() {
+        let Ok(t) = std::fs::read_link(&cur) else {
+            break;
+        };
+        let next = match cur.parent() {
             Some(parent) => parent.join(t),
             None => t,
         };
-        p = normalize(&next);
+        cur = normalize(&next);
+        chain.push(cur.clone());
     }
-    p
+    chain
 }
 
-/// Real path -> the watched (symlink) paths it stands behind.
+/// The real file behind `p`: the last element of `link_chain(p)`. Unlike
+/// `canonicalize`, this still answers when the last target does not exist
+/// (yet), so a link whose target was deleted is still watched where the target
+/// will come back.
+pub fn link_target(p: &Path) -> PathBuf {
+    link_chain(p).pop().expect("link_chain is non-empty")
+}
+
+/// Real or intermediate path -> the watched (symlink) paths it stands behind.
 type Links = Arc<Mutex<HashMap<PathBuf, Vec<PathBuf>>>>;
+
+/// Ancestor folders watched as proxies for missing parent folders.
+type Proxies = Arc<Mutex<HashSet<PathBuf>>>;
 
 /// Watches the parent folders of the given files, so that in-place writes,
 /// rename replacements, and delete-and-recreate are all noticed. A file that
-/// is a symlink also has its target's folder watched; FSEvents reports the
-/// target's path, which is passed on together with the link's path.
+/// is a symlink also has every hop's folder watched; FSEvents reports the
+/// hop's path, which is passed on together with the link's path. Missing
+/// parent folders are watched via their nearest existing ancestor.
 pub struct FsWatch {
     debouncer: Debouncer<RecommendedWatcher>,
     dirs: HashSet<PathBuf>,
     links: Links,
+    proxies: Proxies,
+    resync: Arc<AtomicBool>,
+    file_dirs: HashMap<PathBuf, HashSet<PathBuf>>,
 }
 
 impl FsWatch {
     pub fn new(tx: Sender<AppEvent>) -> notify::Result<Self> {
         let links: Links = Arc::default();
-        let shared = links.clone();
+        let proxies: Proxies = Arc::default();
+        let resync = Arc::new(AtomicBool::new(false));
+        let shared_links = links.clone();
+        let shared_proxies = proxies.clone();
+        let shared_resync = resync.clone();
         let debouncer = new_debouncer(
             DEBOUNCE,
             move |res: notify_debouncer_mini::DebounceEventResult| {
                 if let Ok(events) = res {
-                    let links = shared.lock().unwrap_or_else(PoisonError::into_inner);
+                    let links = shared_links.lock().unwrap_or_else(PoisonError::into_inner);
+                    let proxies = shared_proxies
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner);
                     let mut paths = Vec::new();
+                    let mut need_resync = false;
                     for e in &events {
                         let p = normalize(&e.path);
+                        if p.parent().is_some_and(|parent| proxies.contains(parent)) {
+                            need_resync = true;
+                        }
                         if let Some(ls) = links.get(&p) {
                             paths.extend(ls.iter().cloned());
                         }
                         paths.push(p);
+                    }
+                    if need_resync {
+                        shared_resync.store(true, Ordering::Release);
                     }
                     if !paths.is_empty() {
                         let _ = tx.send(AppEvent::Fs(paths));
@@ -81,29 +117,61 @@ impl FsWatch {
             debouncer,
             dirs: HashSet::new(),
             links,
+            proxies,
+            resync,
+            file_dirs: HashMap::new(),
         })
     }
 
-    /// Watch the parent folder of each file and of each symlink's target
-    /// (once per folder) and stop watching folders no longer needed. Files
-    /// without a parent are skipped. Symlinks are read again on every call,
-    /// so call it again after a link may have been pointed elsewhere.
-    pub fn set_files(&mut self, files: &[&Path]) -> notify::Result<()> {
+    /// Returns `true` once if an event was observed directly under a proxy
+    /// ancestor folder (meaning a missing folder may now exist).
+    pub fn take_resync(&self) -> bool {
+        self.resync.swap(false, Ordering::AcqRel)
+    }
+
+    /// Watch the parent folder (or nearest existing ancestor) of every hop in
+    /// each file's `link_chain` (once per folder) and stop watching folders no
+    /// longer needed. Files without a parent are skipped. Symlinks are read
+    /// again on every call, so call it again after a link may have been
+    /// pointed elsewhere.
+    ///
+    /// Returns `Ok(true)` if any file that was also present in the previous
+    /// call now has a different set of watched folders.
+    pub fn set_files(&mut self, files: &[&Path]) -> notify::Result<bool> {
         let mut links: HashMap<PathBuf, Vec<PathBuf>> = HashMap::new();
-        let mut real = Vec::new();
+        let mut new_proxies: HashSet<PathBuf> = HashSet::new();
+        let mut want: HashSet<PathBuf> = HashSet::new();
+        let mut new_file_dirs: HashMap<PathBuf, HashSet<PathBuf>> = HashMap::new();
+        let mut changed = false;
+
         for f in files {
-            let (path, target) = (normalize(f), link_target(f));
-            if target != path {
-                links.entry(target.clone()).or_default().push(path.clone());
-                real.push(target);
+            let chain = link_chain(f);
+            let path = chain[0].clone();
+            let mut f_dirs = HashSet::new();
+            for hop in &chain {
+                if hop != &path {
+                    links.entry(hop.clone()).or_default().push(path.clone());
+                }
+                if let Some((dir, is_proxy)) = watch_dir_for(hop) {
+                    if is_proxy {
+                        new_proxies.insert(dir.clone());
+                    }
+                    want.insert(dir.clone());
+                    f_dirs.insert(dir);
+                }
             }
-            real.push(path);
+            if let Some(prev) = self.file_dirs.get(&path)
+                && prev != &f_dirs
+            {
+                changed = true;
+            }
+            new_file_dirs.insert(path, f_dirs);
         }
+
+        self.file_dirs = new_file_dirs;
+        *self.proxies.lock().unwrap_or_else(PoisonError::into_inner) = new_proxies;
         *self.links.lock().unwrap_or_else(PoisonError::into_inner) = links;
-        let want: HashSet<PathBuf> = real
-            .iter()
-            .filter_map(|f| f.parent().map(Path::to_path_buf))
-            .collect();
+
         let stale: Vec<PathBuf> = self.dirs.difference(&want).cloned().collect();
         for d in stale {
             // The folder may be gone already; nothing left to unwatch then.
@@ -131,8 +199,25 @@ impl FsWatch {
                 }
             }
         }
-        first_err.map_or(Ok(()), Err)
+        first_err.map_or(Ok(changed), Err)
     }
+}
+
+/// Returns the parent directory of `p` if it exists, or the nearest existing
+/// ancestor directory marked as a proxy (`is_proxy = true`).
+fn watch_dir_for(p: &Path) -> Option<(PathBuf, bool)> {
+    let direct = p.parent()?;
+    if direct.is_dir() {
+        return Some((direct.to_path_buf(), false));
+    }
+    let mut cur = direct.parent();
+    while let Some(anc) = cur {
+        if anc.is_dir() {
+            return Some((anc.to_path_buf(), true));
+        }
+        cur = anc.parent();
+    }
+    None
 }
 
 #[cfg(test)]
@@ -243,28 +328,6 @@ mod tests {
     }
 
     #[test]
-    fn a_failing_folder_does_not_stop_the_others() {
-        let d = tempfile::tempdir().unwrap();
-        let missing = d.path().join("missing").join("x");
-        let p = d.path().join("s.json");
-        std::fs::write(&p, "{}").unwrap();
-        let (tx, rx) = channel();
-        let mut w = FsWatch::new(tx).unwrap();
-        // Each fresh `want` set may be visited in a different (hash) order.
-        for files in [
-            [missing.as_path(), p.as_path()],
-            [p.as_path(), missing.as_path()],
-        ] {
-            w.set_files(&[]).unwrap();
-            assert!(w.set_files(&files).is_err());
-            assert_eq!(w.dirs.len(), 1, "only the existing folder is recorded");
-            std::thread::sleep(Duration::from_millis(200));
-            std::fs::write(&p, "2").unwrap();
-            assert!(wait_for(&rx, &normalize(&p)));
-        }
-    }
-
-    #[test]
     fn symlinked_file_reports_its_link_when_the_target_changes() {
         let links = tempfile::tempdir().unwrap();
         let targets = tempfile::tempdir().unwrap();
@@ -295,5 +358,104 @@ mod tests {
         let mut w = FsWatch::new(tx).unwrap();
         w.set_files(&[&p, &q, Path::new("/")]).unwrap();
         assert_eq!(w.dirs.len(), 1);
+    }
+
+    #[test]
+    fn normalize_resolves_through_a_missing_folder() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("new/sub/a.txt");
+        assert_eq!(
+            normalize(&p),
+            d.path().canonicalize().unwrap().join("new/sub/a.txt")
+        );
+    }
+
+    #[test]
+    fn link_chain_lists_every_hop() {
+        let d = tempfile::tempdir().unwrap();
+        let e = tempfile::tempdir().unwrap();
+        let f = tempfile::tempdir().unwrap();
+        let a = d.path().join("a");
+        let b = e.path().join("b");
+        let c = f.path().join("c");
+        std::os::unix::fs::symlink(&b, &a).unwrap();
+        std::os::unix::fs::symlink(&c, &b).unwrap();
+        assert_eq!(
+            link_chain(&a),
+            vec![normalize(&a), normalize(&b), normalize(&c)]
+        );
+    }
+
+    #[test]
+    fn missing_folder_is_watched_through_its_ancestor_without_retrying() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("new/a.txt");
+        let (tx, _rx) = channel();
+        let mut w = FsWatch::new(tx).unwrap();
+        assert!(!w.set_files(&[&p]).unwrap());
+        assert!(!w.set_files(&[&p]).unwrap());
+        assert_eq!(w.dirs.len(), 1);
+        assert!(w.dirs.contains(&d.path().canonicalize().unwrap()));
+    }
+
+    #[test]
+    fn file_in_a_folder_created_later_is_seen() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("new/a.txt");
+        let (tx, rx) = channel();
+        let mut w = FsWatch::new(tx).unwrap();
+        assert!(!w.set_files(&[&p]).unwrap());
+        std::thread::sleep(Duration::from_millis(200));
+        std::fs::create_dir(d.path().join("new")).unwrap();
+        let end = Instant::now() + Duration::from_secs(2);
+        while !w.take_resync() {
+            assert!(Instant::now() < end, "timed out waiting for resync");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(w.set_files(&[&p]).unwrap());
+        std::thread::sleep(Duration::from_millis(200));
+        std::fs::write(&p, "hello").unwrap();
+        assert!(wait_for(&rx, &normalize(&p)));
+    }
+
+    #[test]
+    fn a_mid_chain_link_in_another_folder_is_watched() {
+        let d = tempfile::tempdir().unwrap();
+        let e = tempfile::tempdir().unwrap();
+        let f = tempfile::tempdir().unwrap();
+        let a = d.path().join("a");
+        let b = e.path().join("b");
+        let c = f.path().join("c");
+        let c2 = f.path().join("c2");
+        std::fs::write(&c, "1").unwrap();
+        std::fs::write(&c2, "2").unwrap();
+        std::os::unix::fs::symlink(&b, &a).unwrap();
+        std::os::unix::fs::symlink(&c, &b).unwrap();
+        let (tx, rx) = channel();
+        let mut w = FsWatch::new(tx).unwrap();
+        w.set_files(&[&a]).unwrap();
+        std::thread::sleep(Duration::from_millis(200));
+        std::fs::remove_file(&b).unwrap();
+        std::os::unix::fs::symlink(&c2, &b).unwrap();
+        std::fs::write(&c2, "3").unwrap();
+        assert!(wait_for(&rx, &normalize(&a)));
+    }
+
+    #[test]
+    fn retargeting_a_link_reports_a_change() {
+        let d = tempfile::tempdir().unwrap();
+        let e = tempfile::tempdir().unwrap();
+        let f = tempfile::tempdir().unwrap();
+        let a = d.path().join("a");
+        let x = e.path().join("x");
+        let y = f.path().join("y");
+        std::os::unix::fs::symlink(&x, &a).unwrap();
+        let (tx, _rx) = channel();
+        let mut w = FsWatch::new(tx).unwrap();
+        assert!(!w.set_files(&[&a]).unwrap());
+        std::fs::remove_file(&a).unwrap();
+        std::os::unix::fs::symlink(&y, &a).unwrap();
+        assert!(w.set_files(&[&a]).unwrap());
+        assert!(!w.set_files(&[&a]).unwrap());
     }
 }

@@ -65,9 +65,6 @@ pub enum Action {
 /// What one tab remembers.
 #[derive(Default)]
 struct TabState {
-    /// The file this tab showed last.
-    #[allow(dead_code)] // recorded for the tab history of stage 2; nothing reads it yet
-    file: Option<PathBuf>,
     /// The position of every file seen in this tab.
     scrolls: HashMap<PathBuf, Scroll>,
 }
@@ -180,11 +177,10 @@ impl App {
         }
     }
 
-    /// Writes the shown file and its position into the tab it belongs to.
+    /// Writes the shown file's position into the tab it belongs to.
     fn remember(&mut self) {
         let Some(s) = &self.shown else { return };
         let tab = self.tabs.entry(self.shown_tab.clone()).or_default();
-        tab.file = Some(s.path.clone());
         tab.scrolls.insert(s.path.clone(), s.scroll);
     }
 

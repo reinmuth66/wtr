@@ -502,12 +502,24 @@ impl Viewer {
             .cloned()
             .chain(self.app.watched_file().map(Path::to_path_buf))
             .collect();
-        if want == self.watching {
+        if want == self.watching && !self.watch.take_resync() {
             return;
         }
         let files: Vec<&Path> = want.iter().map(PathBuf::as_path).collect();
-        if self.watch.set_files(&files).is_ok() {
+        if let Ok(changed) = self.watch.set_files(&files) {
             self.watching = want;
+            if changed {
+                if let Some(state) = &self.state
+                    && let Ok(bytes) = std::fs::read(state)
+                {
+                    let action = self.app.on_state_bytes(&normalize_state(&bytes));
+                    let _ = self.act(action);
+                }
+                if let Some(p) = self.app.watched_file().map(Path::to_path_buf) {
+                    let action = self.app.on_fs_change(&p);
+                    let _ = self.act(action);
+                }
+            }
         }
     }
 

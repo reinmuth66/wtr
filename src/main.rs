@@ -257,12 +257,7 @@ fn render(f: &mut Frame, app: &App, image: &mut Option<StatefulProtocol>) {
     }
 }
 
-fn render_body(
-    f: &mut Frame,
-    app: &App,
-    image: &mut Option<StatefulProtocol>,
-    body: Rect,
-) {
+fn render_body(f: &mut Frame, app: &App, image: &mut Option<StatefulProtocol>, body: Rect) {
     let shown = app.shown();
     let Some(s) = shown else {
         f.render_widget(no_file_line(), body);

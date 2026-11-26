@@ -39,7 +39,6 @@
             clippy
             rustfmt
             rust-analyzer
-            delta
           ];
         };
       });

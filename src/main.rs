@@ -1,4 +1,4 @@
-use std::io::{self, Stdout, stdout};
+use std::io::{self, Read, Stdout, stdout};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
@@ -11,6 +11,8 @@ use ratatui::crossterm::{cursor, execute};
 // Used by the header line, which is off (issue #1).
 // use ratatui::layout::{Constraint, Layout};
 use ratatui::layout::Rect;
+use ratatui::style::Style;
+use ratatui::text::Line;
 use ratatui::widgets::Paragraph;
 use ratatui::{Frame, Terminal};
 use ratatui_image::StatefulImage;
@@ -18,13 +20,18 @@ use ratatui_image::picker::cap_parser::QueryStdioOptions;
 use ratatui_image::picker::{Picker, ProtocolType};
 use ratatui_image::protocol::StatefulProtocol;
 
-use wtr::app::{Action, App, Body, Shown, Viewport};
-use wtr::cli::{Mode, parse_args};
+use wtr::app::{Action, App, Body, Pane, Shown, Viewport};
+use wtr::browser::{self, BrowserCmd};
+use wtr::cli::{Command, Source, View, parse_args};
 use wtr::event::AppEvent;
 use wtr::external::build_command;
 use wtr::highlight::Highlighter;
-use wtr::kind::FileKind;
+use wtr::icons;
+use wtr::kind::{FileKind, SNIFF_LEN, classify};
 use wtr::loader::spawn_load;
+use wtr::row_text::Ctx;
+use wtr::tail::spawn_read;
+use wtr::theme;
 // `header_line` is not used while the header line is off (issue #1).
 // use wtr::view::header_line;
 use wtr::view::{LinesView, TextView, info_lines, message_line, no_file_line};
@@ -39,15 +46,27 @@ const IDLE_WAIT: Duration = Duration::from_millis(250);
 const HL_BUDGET: Duration = Duration::from_millis(8);
 
 fn main() -> anyhow::Result<()> {
-    let mode = match parse_args(std::env::args_os()) {
-        Ok(mode) => mode,
+    let view = match parse_args(std::env::args_os()) {
+        Ok(Command::View(v)) => v,
+        Ok(Command::ScanRecords(paths)) => {
+            let roots = if paths.is_empty() {
+                std::env::var_os("HOME")
+                    .map(|h| vec![PathBuf::from(h).join(".claude/projects")])
+                    .unwrap_or_default()
+            } else {
+                paths
+            };
+            let files = wtr::scan::jsonl_files(&roots);
+            println!("{}", wtr::scan::scan(&files));
+            return Ok(());
+        }
         Err(e) => e.exit(),
     };
     let (tx, rx) = mpsc::channel();
     let watch = FsWatch::new(tx.clone())?;
     install_panic_hook();
     enter()?;
-    let result = Viewer::start(mode, watch, tx).and_then(|mut v| v.run(&rx));
+    let result = Viewer::start(view, watch, tx).and_then(|mut v| v.run(&rx));
     leave()?;
     Ok(result?)
 }
@@ -201,32 +220,69 @@ fn input_loop(gate: &(Mutex<Gate>, Condvar), tx: &Sender<AppEvent>) {
     cv.notify_all();
 }
 
-/// State-file bytes with `file` made absolute-normalized, so the paths the App
-/// holds match the ones file events arrive with. Bytes that do not parse are
-/// passed on unchanged (the App keeps the previous display for them).
+/// State-file bytes with `file` and `session` made absolute-normalized, so the
+/// paths the App holds match the ones file events arrive with. Bytes that do
+/// not parse are passed on unchanged (the App keeps the previous display for
+/// them).
 fn normalize_state(bytes: &[u8]) -> Vec<u8> {
     let Ok(mut v) = serde_json::from_slice::<serde_json::Value>(bytes) else {
         return bytes.to_vec();
     };
-    if let Some(serde_json::Value::String(f)) = v.get_mut("file") {
-        *f = normalize(Path::new(f)).to_string_lossy().into_owned();
+    for key in ["file", "session"] {
+        if let Some(serde_json::Value::String(p)) = v.get_mut(key) {
+            *p = normalize(Path::new(p)).to_string_lossy().into_owned();
+        }
     }
     serde_json::to_vec(&v).unwrap_or_else(|_| bytes.to_vec())
 }
 
-/// The state-file bytes that show one fixed file.
-fn file_state(file: &Path) -> Vec<u8> {
-    serde_json::json!({ "file": file.to_string_lossy() })
-        .to_string()
-        .into_bytes()
+/// The state-file bytes that show fixed file and/or session paths.
+fn file_state(file: Option<&Path>, session: Option<&Path>) -> Vec<u8> {
+    let mut map = serde_json::Map::new();
+    if let Some(f) = file {
+        map.insert("file".into(), serde_json::json!(f.to_string_lossy()));
+    }
+    if let Some(s) = session {
+        map.insert("session".into(), serde_json::json!(s.to_string_lossy()));
+    }
+    serde_json::Value::Object(map).to_string().into_bytes()
 }
 
-/// A changed path worth any work: the state file or the watched file.
-fn is_relevant(p: &Path, state: Option<&Path>, watched: Option<&Path>) -> bool {
-    Some(p) == state || Some(p) == watched
+/// A changed path worth any work: the state file, the watched file, or the watched session.
+fn is_relevant(
+    p: &Path,
+    state: Option<&Path>,
+    watched_file: Option<&Path>,
+    watched_session: Option<&Path>,
+) -> bool {
+    Some(p) == state || Some(p) == watched_file || Some(p) == watched_session
 }
 
-fn render(f: &mut Frame, app: &App, image: &mut Option<StatefulProtocol>) {
+fn no_session_line() -> Line<'static> {
+    Line::styled(
+        format!("{} no session", icons::NO_SESSION),
+        Style::default().fg(theme::OVERLAY1),
+    )
+}
+
+fn sniff_kind(path: &Path) -> FileKind {
+    let Ok(meta) = std::fs::metadata(path) else {
+        return FileKind::Other;
+    };
+    if !meta.is_file() {
+        return FileKind::Other;
+    }
+    let Ok(file) = std::fs::File::open(path) else {
+        return FileKind::Other;
+    };
+    let mut head = Vec::new();
+    if file.take(SNIFF_LEN as u64).read_to_end(&mut head).is_err() {
+        return FileKind::Other;
+    }
+    classify(path, &head)
+}
+
+fn render(f: &mut Frame, app: &mut App, image: &mut Option<StatefulProtocol>) {
     // The header line (kind mark and file name) is not drawn: wtr only shows
     // the preview (issue #1). It may come back depending on the tree's design.
     // let [head, body] =
@@ -257,12 +313,18 @@ fn render(f: &mut Frame, app: &App, image: &mut Option<StatefulProtocol>) {
     }
 }
 
-fn render_body(
-    f: &mut Frame,
-    app: &App,
-    image: &mut Option<StatefulProtocol>,
-    body: Rect,
-) {
+fn render_body(f: &mut Frame, app: &mut App, image: &mut Option<StatefulProtocol>, body: Rect) {
+    if app.pane() == Pane::History {
+        let vp = Viewport {
+            width: body.width,
+            height: body.height,
+        };
+        match app.history_view(vp) {
+            Some(view) => f.render_widget(view, body),
+            None => f.render_widget(no_session_line(), body),
+        }
+        return;
+    }
     let shown = app.shown();
     let Some(s) = shown else {
         f.render_widget(no_file_line(), body);
@@ -294,7 +356,8 @@ struct Viewer {
     image: Option<StatefulProtocol>,
     input: Input,
     tx: Sender<AppEvent>,
-    /// The normalized state file (`None` when showing one fixed file).
+    browser: Sender<BrowserCmd>,
+    /// The normalized state file (`None` when showing fixed paths).
     state: Option<PathBuf>,
     watch: FsWatch,
     /// What `watch` was last set to successfully.
@@ -303,36 +366,47 @@ struct Viewer {
 
 impl Viewer {
     /// Needs the terminal entered: the picker query comes before the input thread.
-    fn start(mode: Mode, watch: FsWatch, tx: Sender<AppEvent>) -> io::Result<Self> {
+    fn start(view: View, watch: FsWatch, tx: Sender<AppEvent>) -> io::Result<Self> {
         let terminal = Terminal::new(CrosstermBackend::new(stdout()))?;
         let picker = make_picker();
         let input = Input::start(tx.clone())?;
-        let (state, file) = match mode {
-            Mode::State(p) => (Some(normalize(&p)), None),
-            Mode::File(f) => (None, Some(normalize(&f))),
+        let path_var = std::env::var_os("PATH");
+        let browser = browser::start(path_var.clone(), view.on_browse, tx.clone());
+        let ctx = Ctx {
+            home: std::env::var_os("HOME").map(PathBuf::from),
+            icon_width: view.icon_width,
+        };
+        let (state, file, session) = match view.source {
+            Source::State(p) => (Some(normalize(&p)), None, None),
+            Source::Fixed { file, session } => (
+                None,
+                file.map(|f| normalize(&f)),
+                session.map(|s| normalize(&s)),
+            ),
         };
         let mut v = Self {
-            app: App::new(Highlighter::new()),
+            app: App::new(Highlighter::new(), ctx, path_var),
             terminal,
             picker,
             picker_stale: false,
             image: None,
             input,
             tx,
+            browser,
             state,
             watch,
             watching: Vec::new(),
         };
         // Watch before every read, so a write in between is not missed: the
-        // state file before reading it, the shown file before loading it.
+        // state file before reading it, the shown file/session before loading.
         v.sync_watch();
-        let first = match (&v.state, file) {
-            (Some(p), _) => normalize_state(&std::fs::read(p).unwrap_or_default()),
-            (None, f) => f.map(|f| file_state(&f)).unwrap_or_default(),
+        let first = match &v.state {
+            Some(p) => normalize_state(&std::fs::read(p).unwrap_or_default()),
+            None => file_state(file.as_deref(), session.as_deref()),
         };
-        let action = v.app.on_state_bytes(&first);
+        let actions = v.app.on_state_bytes(&first);
         v.sync_watch();
-        v.act(action)?;
+        v.act_all(actions)?;
         Ok(v)
     }
 
@@ -395,25 +469,58 @@ impl Viewer {
                 self.watching.clear();
                 Ok(false)
             }
+            AppEvent::SessionRead(r) => {
+                let action = self.app.on_session_read(r, self.viewport());
+                self.act(action)
+            }
+            AppEvent::Message(m) => {
+                self.app.set_message(Some(m));
+                Ok(false)
+            }
         }
     }
 
+    fn apply_state(&mut self, bytes: &[u8]) -> io::Result<bool> {
+        let prev_tab = self.app.tab();
+        let actions = self.app.on_state_bytes(bytes);
+        let new_tab = self.app.tab();
+        if new_tab != prev_tab {
+            let _ = self.browser.send(BrowserCmd::Follow { tab: new_tab });
+        }
+        self.act_all(actions)
+    }
+
     fn on_fs(&mut self, mut paths: Vec<PathBuf>) -> io::Result<bool> {
-        let watched = self.app.watched_file().map(Path::to_path_buf);
-        paths.retain(|p| is_relevant(p, self.state.as_deref(), watched.as_deref()));
+        let watched_file = self.app.watched_file().map(Path::to_path_buf);
+        let watched_session = self.app.watched_session().map(Path::to_path_buf);
+        paths.retain(|p| {
+            is_relevant(
+                p,
+                self.state.as_deref(),
+                watched_file.as_deref(),
+                watched_session.as_deref(),
+            )
+        });
         paths.sort();
         paths.dedup();
         if let Some(state) = &self.state
             && paths.contains(state)
             && let Ok(bytes) = std::fs::read(state)
+            && self.apply_state(&normalize_state(&bytes))?
         {
-            let action = self.app.on_state_bytes(&normalize_state(&bytes));
-            if self.act(action)? {
+            return Ok(true);
+        }
+        for p in &paths {
+            let actions = self.app.on_fs_change(p);
+            if self.act_all(actions)? {
                 return Ok(true);
             }
         }
-        for p in &paths {
-            let action = self.app.on_fs_change(p);
+        Ok(false)
+    }
+
+    fn act_all(&mut self, actions: Vec<Action>) -> io::Result<bool> {
+        for action in actions {
             if self.act(action)? {
                 return Ok(true);
             }
@@ -426,7 +533,22 @@ impl Viewer {
         match action {
             Action::None => {}
             Action::Load { path, generation } => spawn_load(path, generation, self.tx.clone()),
-            Action::Open { path, kind, alt } => self.open_external(&path, kind, alt)?,
+            Action::ReadSession {
+                path,
+                offset,
+                generation,
+            } => spawn_read(path, offset, generation, self.tx.clone()),
+            Action::Open { path, kind, alt } => {
+                let kind = kind.unwrap_or_else(|| sniff_kind(&path));
+                self.open_external(&path, kind, alt)?;
+            }
+            Action::Browse { url } => {
+                let _ = self.browser.send(BrowserCmd::Open {
+                    tab: self.app.tab(),
+                    url,
+                });
+            }
+            Action::Redraw => self.redraw_all()?,
             Action::Quit => return Ok(true),
         }
         Ok(false)
@@ -493,21 +615,41 @@ impl Viewer {
         };
     }
 
-    /// Watches the state file and the watched file; a failure is retried on
-    /// the next turn and never stops the viewer.
+    /// Watches the state file, the watched file, and the watched session;
+    /// a failure is retried on the next turn and never stops the viewer.
     fn sync_watch(&mut self) {
         let want: Vec<PathBuf> = self
             .state
             .iter()
             .cloned()
             .chain(self.app.watched_file().map(Path::to_path_buf))
+            .chain(self.app.watched_session().map(Path::to_path_buf))
             .collect();
-        if want == self.watching {
+        if want == self.watching && !self.watch.take_resync() {
             return;
         }
         let files: Vec<&Path> = want.iter().map(PathBuf::as_path).collect();
-        if self.watch.set_files(&files).is_ok() {
+        if let Ok(changed) = self.watch.set_files(&files) {
             self.watching = want;
+            if changed {
+                if let Some(state) = &self.state
+                    && let Ok(bytes) = std::fs::read(state)
+                {
+                    let _ = self.apply_state(&normalize_state(&bytes));
+                }
+                let watched_file = self.app.watched_file().map(Path::to_path_buf);
+                let watched_session = self.app.watched_session().map(Path::to_path_buf);
+                if let Some(p) = &watched_file {
+                    let actions = self.app.on_fs_change(p);
+                    let _ = self.act_all(actions);
+                }
+                if let Some(p) = &watched_session
+                    && watched_file.as_ref() != Some(p)
+                {
+                    let actions = self.app.on_fs_change(p);
+                    let _ = self.act_all(actions);
+                }
+            }
         }
     }
 
@@ -522,7 +664,7 @@ impl Viewer {
     }
 
     fn draw(&mut self) -> io::Result<()> {
-        let (app, image) = (&self.app, &mut self.image);
+        let (app, image) = (&mut self.app, &mut self.image);
         self.terminal.draw(|f| render(f, app, image))?;
         Ok(())
     }
@@ -551,17 +693,43 @@ mod tests {
 
     #[test]
     fn file_state_names_the_file() {
-        let s = parse_state(&file_state(Path::new("/x/a b.txt"))).unwrap();
+        let s = parse_state(&file_state(Some(Path::new("/x/a b.txt")), None)).unwrap();
         assert_eq!(s.file.as_deref(), Some(Path::new("/x/a b.txt")));
+        assert!(s.session.is_none());
     }
 
     #[test]
     fn only_state_and_watched_paths_are_relevant() {
-        let (s, w) = (Path::new("/s.json"), Path::new("/a.txt"));
-        assert!(is_relevant(s, Some(s), Some(w)));
-        assert!(is_relevant(w, Some(s), Some(w)));
-        assert!(is_relevant(w, None, Some(w)));
-        assert!(!is_relevant(Path::new("/tmp/other"), Some(s), Some(w)));
-        assert!(!is_relevant(Path::new("/tmp/other"), None, None));
+        let (s, w, sess) = (
+            Path::new("/s.json"),
+            Path::new("/a.txt"),
+            Path::new("/s.jsonl"),
+        );
+        assert!(is_relevant(s, Some(s), Some(w), Some(sess)));
+        assert!(is_relevant(w, Some(s), Some(w), Some(sess)));
+        assert!(is_relevant(sess, Some(s), Some(w), Some(sess)));
+        assert!(is_relevant(w, None, Some(w), None));
+        assert!(!is_relevant(
+            Path::new("/tmp/other"),
+            Some(s),
+            Some(w),
+            Some(sess)
+        ));
+        assert!(!is_relevant(Path::new("/tmp/other"), None, None, None));
+    }
+
+    #[test]
+    fn session_path_is_normalized_and_relevant() {
+        let d = tempfile::tempdir().unwrap();
+        let raw_session = d.path().join("s.jsonl");
+        let bytes = serde_json::json!({
+            "tab": "1",
+            "session": raw_session.to_str().unwrap()
+        })
+        .to_string();
+        let parsed = parse_state(&normalize_state(bytes.as_bytes())).unwrap();
+        let norm = normalize(&raw_session);
+        assert_eq!(parsed.session, Some(norm.clone()));
+        assert!(is_relevant(&norm, None, None, Some(&norm)));
     }
 }

@@ -66,7 +66,7 @@ mod tests {
         assert_eq!(tool_for(FileKind::Tsv, true), ("csvlens", &["-t"][..]));
         assert_eq!(tool_for(FileKind::Json, true).0, "fx");
         assert_eq!(tool_for(FileKind::Image, true).0, "nvim");
-        assert_eq!(tool_for(FileKind::Text, true).0, "nvim"); // HTML is Text too, so nvim in stage 1
+        assert_eq!(tool_for(FileKind::Text, true).0, "nvim");
     }
 
     #[test]

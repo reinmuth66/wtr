@@ -22,6 +22,7 @@
           # nixpkgs builds onig_sys (via syntect) against the system oniguruma.
           nativeBuildInputs = [ pkgs.pkg-config ];
           buildInputs = [ pkgs.oniguruma ];
+          nativeCheckInputs = [ pkgs.delta ];
           # The watch tests rely on FSEvents, which is unreliable inside the nix build.
           checkFlags = [
             "--skip"
@@ -38,6 +39,7 @@
             clippy
             rustfmt
             rust-analyzer
+            delta
           ];
         };
       });

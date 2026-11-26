@@ -7,7 +7,6 @@ use std::path::{Path, PathBuf};
 pub struct StateFile {
     pub tab: Option<String>,
     pub file: Option<PathBuf>,
-    pub session: Option<PathBuf>,
 }
 
 /// Parse the state file. Broken, empty or mistyped content gives `None`,
@@ -68,6 +67,8 @@ mod tests {
     use std::path::Path;
 
     #[test]
+    /// A `session` key (written by tools from when wtr showed the session
+    /// history) and other unknown keys are ignored.
     fn parses_full() {
         let s = parse_state(br#"{"tab":"1","file":"/a","session":"/s.jsonl","x":1}"#).unwrap();
         assert_eq!(
@@ -75,7 +76,6 @@ mod tests {
             StateFile {
                 tab: Some("1".into()),
                 file: Some("/a".into()),
-                session: Some("/s.jsonl".into())
             }
         );
     }

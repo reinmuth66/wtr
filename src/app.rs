@@ -3,10 +3,7 @@
 //! `App` never touches the terminal. It is driven by events and answers with
 //! `Action`s for the main loop to carry out.
 
-mod history_pane;
-
 use std::collections::HashMap;
-use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -18,14 +15,10 @@ use crate::browser::{file_url, is_html};
 use crate::highlight::{Highlighter, HlCache};
 use crate::kind::FileKind;
 use crate::loader::{Content, Loaded};
-use crate::nav::{HistoryView, Nav, NavKey};
-use crate::row_text::Ctx;
 use crate::state::{Target, parse_state, resolve_target};
-use crate::tail::SessionRead;
 use crate::text_doc::TextDoc;
 use crate::view::{DocRows, text_width};
 use crate::wrap::{Rows, Scroll, clamp, scroll_bottom, scroll_down, scroll_up};
-use history_pane::HistoryPane;
 
 /// The longest a load may block to color the lines on screen.
 const CATCH_UP: Duration = Duration::from_millis(100);
@@ -55,23 +48,11 @@ pub struct Shown {
     pub scroll: Scroll,
 }
 
-/// Which view is currently shown for a tab.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Pane {
-    File,
-    History,
-}
-
 #[derive(Debug, PartialEq)]
 pub enum Action {
     None,
     Load {
         path: PathBuf,
-        generation: u64,
-    },
-    ReadSession {
-        path: PathBuf,
-        offset: u64,
         generation: u64,
     },
     Open {
@@ -82,28 +63,14 @@ pub enum Action {
     Browse {
         url: String,
     },
-    Redraw,
     Quit,
 }
 
 /// What one tab remembers.
+#[derive(Default)]
 struct TabState {
     /// The position of every file seen in this tab.
     scrolls: HashMap<PathBuf, Scroll>,
-    pane: Pane,
-    nav: Nav,
-    session: Option<PathBuf>,
-}
-
-impl Default for TabState {
-    fn default() -> Self {
-        Self {
-            scrolls: HashMap::new(),
-            pane: Pane::File,
-            nav: Nav::default(),
-            session: None,
-        }
-    }
 }
 
 /// A load that has been requested and not yet arrived.
@@ -148,8 +115,6 @@ fn move_scroll(body: &Body, vp: Viewport, s: Scroll, mv: Move) -> Scroll {
 
 pub struct App {
     hl: Highlighter,
-    ctx: Ctx,
-    path_var: Option<OsString>,
     shown: Option<Shown>,
     /// The tab `shown` belongs to.
     shown_tab: Option<String>,
@@ -161,7 +126,6 @@ pub struct App {
     /// watched so that it shows up once created.
     missing: Option<(PathBuf, Option<String>)>,
     generation: u64,
-    history: HistoryPane,
     /// A message and when it was set.
     message: Option<(String, Instant)>,
     /// The previous key was `g`.
@@ -169,11 +133,9 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(hl: Highlighter, ctx: Ctx, path_var: Option<OsString>) -> Self {
+    pub fn new(hl: Highlighter) -> Self {
         Self {
             hl,
-            ctx,
-            path_var,
             shown: None,
             shown_tab: None,
             tab: None,
@@ -181,7 +143,6 @@ impl App {
             pending: None,
             missing: None,
             generation: 0,
-            history: HistoryPane::new(),
             message: None,
             g_pressed: false,
         }
@@ -191,32 +152,8 @@ impl App {
         self.shown.as_ref()
     }
 
-    pub fn pane(&self) -> Pane {
-        self.tabs.get(&self.tab).map_or(Pane::File, |t| t.pane)
-    }
-
     pub fn tab(&self) -> Option<String> {
         self.tab.clone()
-    }
-
-    pub fn watched_session(&self) -> Option<&Path> {
-        self.history.watched()
-    }
-
-    pub fn history_view(&mut self, vp: Viewport) -> Option<HistoryView<'_>> {
-        let tab = self.tabs.entry(self.tab.clone()).or_default();
-        self.history.view(
-            &mut tab.nav,
-            vp,
-            &self.ctx,
-            &self.hl,
-            self.path_var.as_deref(),
-        )
-    }
-
-    #[cfg(test)]
-    fn detail_builds(&self) -> usize {
-        self.history.detail_builds()
     }
 
     pub fn message(&self) -> Option<&str> {
@@ -275,29 +212,6 @@ impl App {
         };
         let mut actions = Vec::new();
         self.tab = state.tab;
-        if let Some(tab_state) = self.tabs.get_mut(&self.tab) {
-            if tab_state.session != state.session {
-                tab_state.session = state.session.clone();
-                tab_state.nav = Nav::default();
-            }
-        } else {
-            self.tabs.insert(
-                self.tab.clone(),
-                TabState {
-                    scrolls: HashMap::new(),
-                    pane: if state.session.is_some() {
-                        Pane::History
-                    } else {
-                        Pane::File
-                    },
-                    nav: Nav::default(),
-                    session: state.session.clone(),
-                },
-            );
-        }
-        if let Some(act) = self.history.set_session(state.session) {
-            actions.push(act);
-        }
         let file_action = match resolve_target(state.file.as_deref()) {
             Target::Keep => Action::None,
             Target::Missing => {
@@ -329,11 +243,6 @@ impl App {
             actions.push(file_action);
         }
         actions
-    }
-
-    pub fn on_session_read(&mut self, r: SessionRead, vp: Viewport) -> Action {
-        let tab = self.tabs.entry(self.tab.clone()).or_default();
-        self.history.on_read(r, &mut tab.nav, vp)
     }
 
     /// Loads `path` for `tab`, starting where that tab last left it.
@@ -414,9 +323,6 @@ impl App {
         if file_action != Action::None {
             actions.push(file_action);
         }
-        if let Some(act) = self.history.on_fs_change(path) {
-            actions.push(act);
-        }
         actions
     }
 
@@ -430,14 +336,8 @@ impl App {
         let half = ((vp.height / 2) as usize).max(1);
         if ctrl {
             return match key.code {
-                KeyCode::Char('d') => match self.pane() {
-                    Pane::File => self.scroll(vp, Move::Down(half)),
-                    Pane::History => self.history_nav(NavKey::HalfDown, vp),
-                },
-                KeyCode::Char('u') => match self.pane() {
-                    Pane::File => self.scroll(vp, Move::Up(half)),
-                    Pane::History => self.history_nav(NavKey::HalfUp, vp),
-                },
+                KeyCode::Char('d') => self.scroll(vp, Move::Down(half)),
+                KeyCode::Char('u') => self.scroll(vp, Move::Up(half)),
                 KeyCode::Char('c') => Action::Quit,
                 _ => Action::None,
             };
@@ -445,65 +345,22 @@ impl App {
         if key.modifiers.contains(KeyModifiers::ALT) {
             return Action::None;
         }
-        if key.code == KeyCode::Tab {
-            let tab = self.tabs.entry(self.tab.clone()).or_default();
-            tab.pane = match tab.pane {
-                Pane::File => Pane::History,
-                Pane::History => Pane::File,
-            };
-            return Action::Redraw;
-        }
-        match self.pane() {
-            Pane::File => match key.code {
-                KeyCode::Char('j') | KeyCode::Down => self.scroll(vp, Move::Down(1)),
-                KeyCode::Char('k') | KeyCode::Up => self.scroll(vp, Move::Up(1)),
-                KeyCode::Char('g') => {
-                    if g_before {
-                        self.scroll(vp, Move::Top)
-                    } else {
-                        self.g_pressed = true;
-                        Action::None
-                    }
+        match key.code {
+            KeyCode::Char('j') | KeyCode::Down => self.scroll(vp, Move::Down(1)),
+            KeyCode::Char('k') | KeyCode::Up => self.scroll(vp, Move::Up(1)),
+            KeyCode::Char('g') => {
+                if g_before {
+                    self.scroll(vp, Move::Top)
+                } else {
+                    self.g_pressed = true;
+                    Action::None
                 }
-                KeyCode::Char('G') => self.scroll(vp, Move::Bottom),
-                KeyCode::Char('o') | KeyCode::Enter => self.open_file(false),
-                KeyCode::Char('O') => self.open_file(true),
-                _ => Action::None,
-            },
-            Pane::History => match key.code {
-                KeyCode::Char('j') | KeyCode::Down => self.history_nav(NavKey::Down, vp),
-                KeyCode::Char('k') | KeyCode::Up => self.history_nav(NavKey::Up, vp),
-                KeyCode::Char('l') | KeyCode::Right => self.history_nav(NavKey::Expand, vp),
-                KeyCode::Char('h') | KeyCode::Left => self.history_nav(NavKey::Collapse, vp),
-                KeyCode::Char('{') => self.history_nav(NavKey::PrevPrompt, vp),
-                KeyCode::Char('}') => self.history_nav(NavKey::NextPrompt, vp),
-                KeyCode::Char('g') => {
-                    if g_before {
-                        self.history_nav(NavKey::Top, vp)
-                    } else {
-                        self.g_pressed = true;
-                        Action::None
-                    }
-                }
-                KeyCode::Char('G') => self.history_nav(NavKey::Bottom, vp),
-                KeyCode::Char('o') | KeyCode::Enter => self.open_history(false),
-                KeyCode::Char('O') => self.open_history(true),
-                _ => Action::None,
-            },
+            }
+            KeyCode::Char('G') => self.scroll(vp, Move::Bottom),
+            KeyCode::Char('o') | KeyCode::Enter => self.open_file(false),
+            KeyCode::Char('O') => self.open_file(true),
+            _ => Action::None,
         }
-    }
-
-    fn history_nav(&mut self, key: NavKey, vp: Viewport) -> Action {
-        let tab = self.tabs.entry(self.tab.clone()).or_default();
-        self.history.apply_nav(
-            key,
-            &mut tab.nav,
-            vp,
-            &self.ctx,
-            &self.hl,
-            self.path_var.as_deref(),
-        );
-        Action::None
     }
 
     fn scroll(&mut self, vp: Viewport, mv: Move) -> Action {
@@ -525,11 +382,6 @@ impl App {
             },
             None => Action::None,
         }
-    }
-
-    fn open_history(&self, alt: bool) -> Action {
-        let nav = self.tabs.get(&self.tab).map(|t| t.nav).unwrap_or_default();
-        self.history.open(&nav, alt)
     }
 
     /// Highlights a little more of the shown text. Returns true while lines
@@ -599,14 +451,7 @@ mod tests {
     }
 
     fn new_app() -> App {
-        App::new(
-            Highlighter::new(),
-            Ctx {
-                home: None,
-                icon_width: 1,
-            },
-            None,
-        )
+        App::new(Highlighter::new())
     }
 
     fn take_load(actions: Vec<Action>) -> (PathBuf, u64) {
@@ -642,6 +487,18 @@ mod tests {
         assert!(a.on_state_bytes(b"{\"fi").is_empty());
         assert!(a.shown().is_none());
         assert!(a.watched_file().is_none());
+    }
+
+    #[test]
+    fn a_leftover_session_key_still_shows_the_file() {
+        let (_d, f) = files(1);
+        let mut a = new_app();
+        let bytes = serde_json::to_vec(&serde_json::json!({
+            "tab": "1", "file": f[0], "session": "/tmp/s.jsonl"
+        }))
+        .unwrap();
+        let (path, _) = take_load(a.on_state_bytes(&bytes));
+        assert_eq!(path, f[0]);
     }
 
     #[test]
@@ -958,341 +815,6 @@ mod tests {
         assert_eq!(line(&a), 90);
     }
 
-    fn state_with_session(
-        tab: Option<&str>,
-        file: Option<&Path>,
-        session: Option<&Path>,
-    ) -> Vec<u8> {
-        let mut map = serde_json::Map::new();
-        if let Some(t) = tab {
-            map.insert("tab".into(), serde_json::json!(t));
-        }
-        if let Some(f) = file {
-            map.insert("file".into(), serde_json::json!(f));
-        }
-        if let Some(s) = session {
-            map.insert("session".into(), serde_json::json!(s));
-        }
-        serde_json::to_vec(&serde_json::Value::Object(map)).unwrap()
-    }
-
-    fn tool_use_rec(id: &str, name: &str, input: serde_json::Value) -> serde_json::Value {
-        serde_json::json!({
-            "type": "assistant",
-            "message": {
-                "role": "assistant",
-                "content": [
-                    { "type": "tool_use", "id": id, "name": name, "input": input }
-                ]
-            }
-        })
-    }
-
-    fn prompt_rec(text: &str) -> serde_json::Value {
-        serde_json::json!({
-            "type": "user",
-            "message": { "role": "user", "content": text }
-        })
-    }
-
-    #[test]
-    fn first_tab_with_session_starts_in_history() {
-        let (_d, f) = files(1);
-        let s = PathBuf::from("/tmp/s.jsonl");
-        let mut a = new_app();
-        let actions = a.on_state_bytes(&state_with_session(Some("1"), Some(&f[0]), Some(&s)));
-        assert_eq!(a.pane(), Pane::History);
-        assert!(actions.iter().any(|act| matches!(
-            act,
-            Action::ReadSession { path, offset: 0, .. } if path == &s
-        )));
-    }
-
-    #[test]
-    fn first_tab_without_session_starts_in_file() {
-        let (_d, f) = files(1);
-        let mut a = new_app();
-        let _ = a.on_state_bytes(&state_with_session(Some("1"), Some(&f[0]), None));
-        assert_eq!(a.pane(), Pane::File);
-    }
-
-    #[test]
-    fn tab_key_toggles_and_redraws() {
-        let (_d, f) = files(1);
-        let mut a = new_app();
-        let _ = a.on_state_bytes(&state_with_session(Some("1"), Some(&f[0]), None));
-        assert_eq!(a.pane(), Pane::File);
-        assert_eq!(
-            a.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE), VP),
-            Action::Redraw
-        );
-        assert_eq!(a.pane(), Pane::History);
-        assert_eq!(
-            a.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE), VP),
-            Action::Redraw
-        );
-        assert_eq!(a.pane(), Pane::File);
-    }
-
-    #[test]
-    fn session_change_in_the_same_tab_resets_the_selection() {
-        let s1 = PathBuf::from("/tmp/s1.jsonl");
-        let s2 = PathBuf::from("/tmp/s2.jsonl");
-        let mut a = new_app();
-        let actions = a.on_state_bytes(&state_with_session(Some("1"), None, Some(&s1)));
-        let gen1 = actions
-            .iter()
-            .find_map(|act| match act {
-                Action::ReadSession { generation, .. } => Some(*generation),
-                _ => None,
-            })
-            .unwrap();
-        let chunk = crate::tail::Chunk {
-            records: vec![prompt_rec("one"), prompt_rec("two"), prompt_rec("three")],
-            end: 100,
-            reset: false,
-        };
-        a.on_session_read(
-            crate::tail::SessionRead {
-                generation: gen1,
-                result: Ok(chunk),
-            },
-            VP,
-        );
-        a.on_key(key('k'), VP);
-        let v = a.history_view(VP).unwrap();
-        assert!(!v.nav.follow);
-        assert_eq!(v.nav.selected, 1);
-
-        let actions2 = a.on_state_bytes(&state_with_session(Some("1"), None, Some(&s2)));
-        assert!(actions2.iter().any(|act| matches!(
-            act,
-            Action::ReadSession { path, offset: 0, .. } if path == &s2
-        )));
-        let v2 = a.history_view(VP).unwrap();
-        assert!(v2.nav.follow);
-        assert_eq!(*v2.nav, crate::nav::Nav::default());
-    }
-
-    fn chained(uuid: &str, parent: Option<&str>, text: &str) -> serde_json::Value {
-        serde_json::json!({
-            "type": "user", "uuid": uuid, "parentUuid": parent,
-            "message": { "role": "user", "content": text }
-        })
-    }
-
-    /// Opens a session in tab 1 and feeds `records` as its first read.
-    fn session_app(records: Vec<serde_json::Value>) -> (App, PathBuf) {
-        let s = PathBuf::from("/tmp/rewind.jsonl");
-        let mut a = new_app();
-        let actions = a.on_state_bytes(&state_with_session(Some("1"), None, Some(&s)));
-        let generation = actions
-            .iter()
-            .find_map(|act| match act {
-                Action::ReadSession { generation, .. } => Some(*generation),
-                _ => None,
-            })
-            .unwrap();
-        read_more(&mut a, generation, records);
-        (a, s)
-    }
-
-    fn read_more(a: &mut App, generation: u64, records: Vec<serde_json::Value>) {
-        a.on_session_read(
-            crate::tail::SessionRead {
-                generation,
-                result: Ok(crate::tail::Chunk {
-                    records,
-                    end: 1,
-                    reset: false,
-                }),
-            },
-            VP,
-        );
-    }
-
-    fn reread(a: &mut App, s: &Path, records: Vec<serde_json::Value>) {
-        let generation = a
-            .on_fs_change(s)
-            .iter()
-            .find_map(|act| match act {
-                Action::ReadSession { generation, .. } => Some(*generation),
-                _ => None,
-            })
-            .unwrap();
-        read_more(a, generation, records);
-    }
-
-    #[test]
-    fn a_rewind_that_hides_the_selected_row_goes_to_the_bottom() {
-        let (mut a, s) = session_app(vec![
-            chained("p1", None, "one"),
-            chained("p2", Some("p1"), "two"),
-            chained("p3", Some("p2"), "three"),
-        ]);
-        a.on_key(key('k'), VP);
-        assert_eq!(a.history_view(VP).unwrap().nav.selected, 1);
-        // Rewound to "one": "two" (selected) and "three" go.
-        reread(&mut a, &s, vec![chained("p4", Some("p1"), "two, again")]);
-        let v = a.history_view(VP).unwrap();
-        assert_eq!(v.history.rows.len(), 2);
-        assert!(v.nav.follow);
-        assert_eq!(v.nav.selected, 1);
-    }
-
-    #[test]
-    fn a_rewind_keeps_a_selection_above_it() {
-        let (mut a, s) = session_app(vec![
-            chained("p1", None, "one"),
-            chained("p2", Some("p1"), "two"),
-            chained("p3", Some("p2"), "three"),
-        ]);
-        a.on_key(key('k'), VP);
-        a.on_key(key('k'), VP);
-        reread(&mut a, &s, vec![chained("p4", Some("p2"), "three, again")]);
-        let v = a.history_view(VP).unwrap();
-        assert_eq!(v.history.rows.len(), 3);
-        assert!(!v.nav.follow);
-        assert_eq!(v.nav.selected, 0);
-    }
-
-    #[test]
-    fn appends_while_reading_are_read_again() {
-        let s = PathBuf::from("/tmp/s.jsonl");
-        let mut a = new_app();
-        let actions = a.on_state_bytes(&state_with_session(Some("1"), None, Some(&s)));
-        let gen1 = actions
-            .iter()
-            .find_map(|act| match act {
-                Action::ReadSession { generation, .. } => Some(*generation),
-                _ => None,
-            })
-            .unwrap();
-        // Change arrives while the first read is still in flight.
-        assert!(a.on_fs_change(&s).is_empty());
-        let next = a.on_session_read(
-            crate::tail::SessionRead {
-                generation: gen1,
-                result: Ok(crate::tail::Chunk {
-                    records: vec![prompt_rec("hi")],
-                    end: 42,
-                    reset: false,
-                }),
-            },
-            VP,
-        );
-        assert!(matches!(
-            next,
-            Action::ReadSession { path, offset: 42, .. } if path == s
-        ));
-    }
-
-    #[test]
-    fn stale_session_reads_are_dropped() {
-        let s1 = PathBuf::from("/tmp/s1.jsonl");
-        let s2 = PathBuf::from("/tmp/s2.jsonl");
-        let mut a = new_app();
-        let actions1 = a.on_state_bytes(&state_with_session(Some("1"), None, Some(&s1)));
-        let gen1 = actions1
-            .iter()
-            .find_map(|act| match act {
-                Action::ReadSession { generation, .. } => Some(*generation),
-                _ => None,
-            })
-            .unwrap();
-        let _ = a.on_state_bytes(&state_with_session(Some("1"), None, Some(&s2)));
-        let act = a.on_session_read(
-            crate::tail::SessionRead {
-                generation: gen1,
-                result: Ok(crate::tail::Chunk {
-                    records: vec![prompt_rec("stale")],
-                    end: 10,
-                    reset: false,
-                }),
-            },
-            VP,
-        );
-        assert_eq!(act, Action::None);
-        assert!(a.history_view(VP).unwrap().history.rows.is_empty());
-    }
-
-    #[test]
-    fn missing_session() {
-        let s = PathBuf::from("/tmp/missing.jsonl");
-        let mut a = new_app();
-        let actions = a.on_state_bytes(&state_with_session(Some("1"), None, Some(&s)));
-        let gen1 = actions
-            .iter()
-            .find_map(|act| match act {
-                Action::ReadSession { generation, .. } => Some(*generation),
-                _ => None,
-            })
-            .unwrap();
-        a.on_session_read(
-            crate::tail::SessionRead {
-                generation: gen1,
-                result: Err(std::io::Error::from(std::io::ErrorKind::NotFound)),
-            },
-            VP,
-        );
-        assert!(a.history_view(VP).is_none());
-    }
-
-    #[test]
-    fn opening_from_history() {
-        let s = PathBuf::from("/tmp/s.jsonl");
-        let mut a = new_app();
-        let actions = a.on_state_bytes(&state_with_session(Some("1"), None, Some(&s)));
-        let gen1 = actions
-            .iter()
-            .find_map(|act| match act {
-                Action::ReadSession { generation, .. } => Some(*generation),
-                _ => None,
-            })
-            .unwrap();
-        a.on_session_read(
-            crate::tail::SessionRead {
-                generation: gen1,
-                result: Ok(crate::tail::Chunk {
-                    records: vec![
-                        prompt_rec("hello"),
-                        tool_use_rec("t1", "Edit", serde_json::json!({"file_path": "/a/b.rs"})),
-                        tool_use_rec(
-                            "t2",
-                            "WebFetch",
-                            serde_json::json!({"url": "https://example.com"}),
-                        ),
-                    ],
-                    end: 100,
-                    reset: false,
-                }),
-            },
-            VP,
-        );
-        // Bottom row is WebFetch
-        assert_eq!(a.on_key(key('o'), VP), Action::None);
-        assert_eq!(
-            a.on_key(key('O'), VP),
-            Action::Browse {
-                url: "https://example.com".into()
-            }
-        );
-        // Move up to Edit
-        a.on_key(key('k'), VP);
-        assert_eq!(
-            a.on_key(key('o'), VP),
-            Action::Open {
-                path: PathBuf::from("/a/b.rs"),
-                kind: None,
-                alt: false,
-            }
-        );
-        // Move up to Prompt
-        a.on_key(key('k'), VP);
-        assert_eq!(a.on_key(key('o'), VP), Action::None);
-        assert_eq!(a.on_key(key('O'), VP), Action::None);
-    }
-
     #[test]
     fn html_goes_to_the_browser() {
         let d = tempfile::tempdir().unwrap();
@@ -1314,133 +836,5 @@ mod tests {
                 alt: false,
             }
         );
-    }
-
-    #[test]
-    fn detail_is_built_once_per_revision() {
-        let s = PathBuf::from("/tmp/s.jsonl");
-        let mut a = new_app();
-        let actions = a.on_state_bytes(&state_with_session(Some("1"), None, Some(&s)));
-        let gen1 = actions
-            .iter()
-            .find_map(|act| match act {
-                Action::ReadSession { generation, .. } => Some(*generation),
-                _ => None,
-            })
-            .unwrap();
-        a.on_session_read(
-            crate::tail::SessionRead {
-                generation: gen1,
-                result: Ok(crate::tail::Chunk {
-                    records: vec![prompt_rec("hello world")],
-                    end: 50,
-                    reset: false,
-                }),
-            },
-            VP,
-        );
-        a.on_key(key('l'), VP);
-        let _ = a.history_view(VP).unwrap();
-        let builds1 = a.detail_builds();
-        let _ = a.history_view(VP).unwrap();
-        let builds2 = a.detail_builds();
-        assert_eq!(builds1, 1);
-        assert_eq!(builds2, 1);
-    }
-
-    #[test]
-    fn detail_scroll_is_clamped_after_resize() {
-        let s = PathBuf::from("/tmp/s.jsonl");
-        let mut a = new_app();
-        let actions = a.on_state_bytes(&state_with_session(Some("1"), None, Some(&s)));
-        let gen1 = actions
-            .iter()
-            .find_map(|act| match act {
-                Action::ReadSession { generation, .. } => Some(*generation),
-                _ => None,
-            })
-            .unwrap();
-        let text = (0..30)
-            .map(|i| format!("line {i}"))
-            .collect::<Vec<_>>()
-            .join("\n");
-        a.on_session_read(
-            crate::tail::SessionRead {
-                generation: gen1,
-                result: Ok(crate::tail::Chunk {
-                    records: vec![prompt_rec(&text)],
-                    end: 100,
-                    reset: false,
-                }),
-            },
-            VP,
-        );
-        a.on_key(key('l'), VP);
-        for _ in 0..20 {
-            a.on_key(ctrl('d'), VP);
-        }
-        assert!(a.history_view(VP).unwrap().nav.detail_scroll > 0);
-        // Resize to a tall viewport where all 30 lines fit.
-        let tall = Viewport {
-            width: 80,
-            height: 50,
-        };
-        assert_eq!(a.history_view(tall).unwrap().nav.detail_scroll, 0);
-    }
-
-    #[test]
-    fn session_rewrite_resets_nav() {
-        let s = PathBuf::from("/tmp/s.jsonl");
-        let mut a = new_app();
-        let actions = a.on_state_bytes(&state_with_session(Some("1"), None, Some(&s)));
-        let gen1 = actions
-            .iter()
-            .find_map(|act| match act {
-                Action::ReadSession { generation, .. } => Some(*generation),
-                _ => None,
-            })
-            .unwrap();
-        a.on_session_read(
-            crate::tail::SessionRead {
-                generation: gen1,
-                result: Ok(crate::tail::Chunk {
-                    records: vec![prompt_rec("one"), prompt_rec("two"), prompt_rec("three")],
-                    end: 100,
-                    reset: false,
-                }),
-            },
-            VP,
-        );
-        a.on_key(key('k'), VP);
-        a.on_key(key('l'), VP);
-        let v = a.history_view(VP).unwrap();
-        assert!(!v.nav.follow);
-        assert!(v.nav.expanded);
-        assert_eq!(v.nav.selected, 1);
-
-        let fs_actions = a.on_fs_change(&s);
-        let gen2 = fs_actions
-            .iter()
-            .find_map(|act| match act {
-                Action::ReadSession { generation, .. } => Some(*generation),
-                _ => None,
-            })
-            .unwrap();
-        a.on_session_read(
-            crate::tail::SessionRead {
-                generation: gen2,
-                result: Ok(crate::tail::Chunk {
-                    records: vec![prompt_rec("a"), prompt_rec("b")],
-                    end: 40,
-                    reset: true,
-                }),
-            },
-            VP,
-        );
-        let v2 = a.history_view(VP).unwrap();
-        assert!(v2.nav.follow);
-        assert!(!v2.nav.expanded);
-        assert_eq!(v2.nav.selected, 1);
-        assert_eq!(v2.nav.detail_scroll, 0);
     }
 }

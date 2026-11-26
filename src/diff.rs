@@ -5,7 +5,7 @@ use std::io::Write;
 use std::process::{Command, Stdio};
 
 use ansi_to_tui::IntoText;
-use ratatui::style::Style;
+use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 use serde_json::Value;
 use unicode_width::UnicodeWidthChar;
@@ -136,6 +136,9 @@ pub fn run_delta(diff: &str, digits: usize, path_var: Option<&OsStr>) -> Result<
 #[derive(Debug, Clone)]
 pub struct DiffRender {
     lines: Vec<Line<'static>>,
+    /// Per line, the background in effect where delta erases to the end of
+    /// the line (`ESC[0K`). An empty `+` / `-` line has no span to carry it.
+    fills: Vec<Option<Color>>,
     gutter: usize,
 }
 
@@ -156,16 +159,20 @@ pub fn parse_delta(ansi: &str, digits: usize) -> DiffRender {
             .collect(),
         Err(_) => ansi.lines().map(|l| Line::raw(l.to_string())).collect(),
     };
+    let mut fills: Vec<Option<Color>> = ansi.lines().map(erase_bg).collect();
+    fills.resize(lines.len(), None);
 
     if lines
         .first()
         .is_some_and(|l| l.spans.iter().all(|s| s.content.is_empty()))
     {
         lines.remove(0);
+        fills.remove(0);
     }
 
     DiffRender {
         lines,
+        fills,
         gutter: 2 * digits + 3,
     }
 }
@@ -179,8 +186,8 @@ impl DiffRender {
         let content_width = width - self.gutter;
         let mut out = Vec::new();
 
-        for line in &self.lines {
-            let bg = line.spans.last().and_then(|s| s.style.bg);
+        for (line, fill) in self.lines.iter().zip(&self.fills) {
+            let bg = fill.or_else(|| line.spans.last().and_then(|s| s.style.bg));
             let (gutter_spans, content_spans) = split_at_width(&line.spans, self.gutter);
             let wrapped = wrap::wrap_spans(&content_spans, content_width);
 
@@ -206,6 +213,39 @@ impl DiffRender {
         }
         out
     }
+}
+
+/// The 24-bit background set by SGR sequences before the last `ESC[0K` in
+/// one raw line of delta output; `None` without `ESC[0K` or with no
+/// background in effect there.
+fn erase_bg(raw: &str) -> Option<Color> {
+    let before = &raw[..raw.rfind("\x1b[0K")?];
+    let mut bg = None;
+    for seq in before.split("\x1b[").skip(1) {
+        let Some(end) = seq.find('m') else { continue };
+        let params: Vec<&str> = seq[..end].split(';').collect();
+        let mut i = 0;
+        while i < params.len() {
+            match params[i] {
+                "" | "0" | "49" => bg = None,
+                "48" if params.get(i + 1) == Some(&"2") => {
+                    let rgb: Vec<u8> = params[i + 2..(i + 5).min(params.len())]
+                        .iter()
+                        .filter_map(|p| p.parse().ok())
+                        .collect();
+                    if let [r, g, b] = rgb[..] {
+                        bg = Some(Color::Rgb(r, g, b));
+                    }
+                    i += 4;
+                }
+                "38" if params.get(i + 1) == Some(&"2") => i += 4,
+                "38" | "48" if params.get(i + 1) == Some(&"5") => i += 2,
+                _ => {}
+            }
+            i += 1;
+        }
+    }
+    bg
 }
 
 fn split_at_width(spans: &[Span<'_>], target: usize) -> (Vec<Span<'static>>, Vec<Span<'static>>) {
@@ -305,6 +345,34 @@ mod tests {
             let last_span = line.spans.last().unwrap();
             assert_eq!(last_span.style.bg, Some(Color::Rgb(52, 70, 55)));
         }
+    }
+
+    #[test]
+    fn wrap_fills_empty_added_and_removed_lines() {
+        // What delta prints for an empty `+` line and an empty `-` line: the
+        // background is set with nothing after it but erase-to-end-of-line.
+        let rendered = parse_delta(
+            "\x1b[34m\x1b[38;5;88m  \x1b[34m \x1b[38;5;28m 4\x1b[34m │\x1b[0m\x1b[48;2;52;70;55m\x1b[0K\x1b[0m\n\
+             \x1b[34m\x1b[38;5;88m 4\x1b[34m \x1b[38;5;28m  \x1b[34m │\x1b[0m\x1b[48;2;73;49;66m\x1b[0K\x1b[0m\n\
+             \x1b[34m\x1b[38;2;68;68;68m 5\x1b[34m \x1b[38;2;68;68;68m 5\x1b[34m │\x1b[0m\n",
+            2,
+        );
+        let wrapped = rendered.wrap(20);
+        assert_eq!(wrapped.len(), 3);
+        for (line, bg) in wrapped[..2]
+            .iter()
+            .zip([Color::Rgb(52, 70, 55), Color::Rgb(73, 49, 66)])
+        {
+            assert_eq!(line.width(), 20);
+            assert_eq!(line.spans.last().unwrap().style.bg, Some(bg));
+        }
+        // An empty context line stays unpainted.
+        assert!(
+            wrapped[2]
+                .spans
+                .iter()
+                .all(|s| !matches!(s.style.bg, Some(Color::Rgb(..))))
+        );
     }
 
     #[test]

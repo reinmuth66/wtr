@@ -1074,6 +1074,88 @@ mod tests {
         assert_eq!(*v2.nav, crate::nav::Nav::default());
     }
 
+    fn chained(uuid: &str, parent: Option<&str>, text: &str) -> serde_json::Value {
+        serde_json::json!({
+            "type": "user", "uuid": uuid, "parentUuid": parent,
+            "message": { "role": "user", "content": text }
+        })
+    }
+
+    /// Opens a session in tab 1 and feeds `records` as its first read.
+    fn session_app(records: Vec<serde_json::Value>) -> (App, PathBuf) {
+        let s = PathBuf::from("/tmp/rewind.jsonl");
+        let mut a = new_app();
+        let actions = a.on_state_bytes(&state_with_session(Some("1"), None, Some(&s)));
+        let generation = actions
+            .iter()
+            .find_map(|act| match act {
+                Action::ReadSession { generation, .. } => Some(*generation),
+                _ => None,
+            })
+            .unwrap();
+        read_more(&mut a, generation, records);
+        (a, s)
+    }
+
+    fn read_more(a: &mut App, generation: u64, records: Vec<serde_json::Value>) {
+        a.on_session_read(
+            crate::tail::SessionRead {
+                generation,
+                result: Ok(crate::tail::Chunk {
+                    records,
+                    end: 1,
+                    reset: false,
+                }),
+            },
+            VP,
+        );
+    }
+
+    fn reread(a: &mut App, s: &Path, records: Vec<serde_json::Value>) {
+        let generation = a
+            .on_fs_change(s)
+            .iter()
+            .find_map(|act| match act {
+                Action::ReadSession { generation, .. } => Some(*generation),
+                _ => None,
+            })
+            .unwrap();
+        read_more(a, generation, records);
+    }
+
+    #[test]
+    fn a_rewind_that_hides_the_selected_row_goes_to_the_bottom() {
+        let (mut a, s) = session_app(vec![
+            chained("p1", None, "one"),
+            chained("p2", Some("p1"), "two"),
+            chained("p3", Some("p2"), "three"),
+        ]);
+        a.on_key(key('k'), VP);
+        assert_eq!(a.history_view(VP).unwrap().nav.selected, 1);
+        // Rewound to "one": "two" (selected) and "three" go.
+        reread(&mut a, &s, vec![chained("p4", Some("p1"), "two, again")]);
+        let v = a.history_view(VP).unwrap();
+        assert_eq!(v.history.rows.len(), 2);
+        assert!(v.nav.follow);
+        assert_eq!(v.nav.selected, 1);
+    }
+
+    #[test]
+    fn a_rewind_keeps_a_selection_above_it() {
+        let (mut a, s) = session_app(vec![
+            chained("p1", None, "one"),
+            chained("p2", Some("p1"), "two"),
+            chained("p3", Some("p2"), "three"),
+        ]);
+        a.on_key(key('k'), VP);
+        a.on_key(key('k'), VP);
+        reread(&mut a, &s, vec![chained("p4", Some("p2"), "three, again")]);
+        let v = a.history_view(VP).unwrap();
+        assert_eq!(v.history.rows.len(), 3);
+        assert!(!v.nav.follow);
+        assert_eq!(v.nav.selected, 0);
+    }
+
     #[test]
     fn appends_while_reading_are_read_again() {
         let s = PathBuf::from("/tmp/s.jsonl");

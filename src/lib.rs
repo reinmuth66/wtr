@@ -1,4 +1,5 @@
 pub mod app;
+pub mod branch;
 pub mod browser;
 pub mod cli;
 pub mod csv_table;

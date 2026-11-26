@@ -741,6 +741,34 @@ fn extract_text(val: Option<&Value>) -> String {
     }
 }
 
+/// True when `rec` makes a prompt row (the same rule as `push_user`).
+pub fn is_prompt_record(rec: &Value) -> bool {
+    let flag = |k: &str| rec.get(k).and_then(Value::as_bool) == Some(true);
+    if rec.get("type").and_then(Value::as_str) != Some("user")
+        || flag("isMeta")
+        || flag("isCompactSummary")
+        || flag("isSidechain")
+    {
+        return false;
+    }
+    let text_counts = |s: &str| s.trim() != INTERRUPT_TOOL_TEXT && filter_prompt_text(s).is_some();
+    match rec.get("message").and_then(|m| m.get("content")) {
+        Some(Value::String(s)) => text_counts(s),
+        Some(Value::Array(arr)) => arr.iter().any(|item| {
+            classify(&content_kind("user", item)) == Class::Use
+                && match item.get("type").and_then(Value::as_str) {
+                    Some("text") => item
+                        .get("text")
+                        .and_then(Value::as_str)
+                        .is_some_and(text_counts),
+                    Some("image") => true,
+                    _ => false,
+                }
+        }),
+        _ => false,
+    }
+}
+
 fn filter_prompt_text(s: &str) -> Option<String> {
     let trimmed = s.trim();
     if trimmed.is_empty()

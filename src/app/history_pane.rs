@@ -7,17 +7,18 @@ use ratatui::text::Line;
 use serde_json::Value;
 
 use crate::app::{Action, Viewport};
+use crate::branch::Conversation;
 use crate::browser::{file_url, is_html};
 use crate::detail::{Detail, detail, wrap_body};
 use crate::highlight::Highlighter;
-use crate::history::{History, Row};
+use crate::history::Row;
 use crate::nav::{self, HistoryView, Nav, NavKey};
 use crate::row_text::Ctx;
 use crate::tail::SessionRead;
 
 struct Session {
     path: PathBuf,
-    history: History,
+    conv: Conversation,
     offset: u64,
     reading: bool,
     again: bool,
@@ -74,7 +75,7 @@ impl HistoryPane {
             Some(p) => {
                 self.session = Some(Session {
                     path: p.clone(),
-                    history: History::new(),
+                    conv: Conversation::new(),
                     offset: 0,
                     reading: true,
                     again: false,
@@ -118,23 +119,33 @@ impl HistoryPane {
         match r.result {
             Err(_) => {
                 s.missing = true;
-                s.history = History::new();
+                s.conv = Conversation::new();
                 s.offset = 0;
                 self.detail = None;
                 *nav = Nav::default();
             }
             Ok(chunk) => {
                 if chunk.reset {
-                    s.history = History::new();
+                    s.conv = Conversation::new();
                     self.detail = None;
                     *nav = Nav::default();
                 }
+                // Rows a rewind left as they were; below them, rows changed.
+                let mut kept: Option<usize> = None;
                 for rec in &chunk.records {
-                    s.history.push(rec);
+                    if let Some(k) = s.conv.push(rec) {
+                        kept = Some(kept.map_or(k, |old| old.min(k)));
+                    }
+                }
+                if let Some(k) = kept {
+                    self.detail = None;
+                    if nav.follow || nav.selected >= k {
+                        *nav = Nav::default();
+                    }
                 }
                 s.offset = chunk.end;
                 s.missing = false;
-                nav::settle(nav, s.history.rows.len(), vp.height as usize);
+                nav::settle(nav, s.conv.history.rows.len(), vp.height as usize);
             }
         }
         if s.again {
@@ -161,10 +172,10 @@ impl HistoryPane {
         path_var: Option<&OsStr>,
     ) {
         let Some(s) = &self.session else { return };
-        if s.missing || s.history.rows.is_empty() {
+        if s.missing || s.conv.history.rows.is_empty() {
             return;
         }
-        let len = s.history.rows.len();
+        let len = s.conv.history.rows.len();
         let detail_rows = if nav.expanded {
             let selected = nav.selected.min(len - 1);
             let bw = body_width(vp.width, ctx.icon_width);
@@ -177,7 +188,7 @@ impl HistoryPane {
             nav,
             key,
             len,
-            |i| matches!(s.history.rows[i], Row::Prompt(_)),
+            |i| matches!(s.conv.history.rows[i], Row::Prompt(_)),
             vp.height as usize,
             detail_rows,
         );
@@ -187,11 +198,11 @@ impl HistoryPane {
         let Some(s) = &self.session else {
             return Action::None;
         };
-        if s.missing || s.history.rows.is_empty() {
+        if s.missing || s.conv.history.rows.is_empty() {
             return Action::None;
         }
-        let idx = nav.selected.min(s.history.rows.len() - 1);
-        let Row::Tool(t) = &s.history.rows[idx] else {
+        let idx = nav.selected.min(s.conv.history.rows.len() - 1);
+        let Row::Tool(t) = &s.conv.history.rows[idx] else {
             return Action::None;
         };
         match t.name.as_str() {
@@ -266,7 +277,7 @@ impl HistoryPane {
         if s.missing {
             return None;
         }
-        let len = s.history.rows.len();
+        let len = s.conv.history.rows.len();
         if len > 0 {
             nav::settle(nav, len, vp.height as usize);
             if nav.expanded {
@@ -280,7 +291,7 @@ impl HistoryPane {
             }
         }
         let s = self.session.as_ref()?;
-        let detail = if nav.expanded && !s.history.rows.is_empty() {
+        let detail = if nav.expanded && !s.conv.history.rows.is_empty() {
             self.detail
                 .as_ref()
                 .map(|c| (&c.detail.header, c.wrapped.as_slice()))
@@ -288,7 +299,7 @@ impl HistoryPane {
             None
         };
         Some(HistoryView {
-            history: &s.history,
+            history: &s.conv.history,
             nav,
             ctx,
             detail,
@@ -304,15 +315,15 @@ impl HistoryPane {
         path_var: Option<&OsStr>,
     ) -> &[Line<'static>] {
         let s = self.session.as_ref().expect("session present");
-        let rev = s.history.revision(row);
+        let rev = s.conv.history.revision(row);
         let hit = self
             .detail
             .as_ref()
             .is_some_and(|c| c.row == row && c.revision == rev);
         if !hit {
             let d = detail(
-                &s.history.rows[row],
-                s.history.tool_counts(row),
+                &s.conv.history.rows[row],
+                s.conv.history.tool_counts(row),
                 ctx,
                 hl,
                 path_var,

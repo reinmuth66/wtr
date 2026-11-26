@@ -139,6 +139,11 @@
   - 捨てる (`attachment`): `agent_listing_delta`、`async_hook_response`、`at_mention_reference`、`auto_mode`、`command_permissions`、`compact_file_reference`、`credential_org`、`critical_system_reminder`、`date`、`deferred_tools_delta`、`deferred_tools_record`、`directory`、`edited_text_file`、`environment`、`file`、`hook_additional_context`、`hook_system_message`、`instructions`、`invoked_skills`、`mcp_instructions_delta`、`model`、`nested_memory`、`plan_mode`、`plan_mode_exit`、`prompt_snapshot`、`read_truncation_notice`、`remote_session_change`、`session_context`、`silent_turn_reminder`、`skill_listing`、`task_reminder`、`task_status`、`thinking_drop`、`total_tokens_reminder`
 - 「捨てる」は「Claude Code の画面に出ない」という意味ではない。`away_summary` (離れていた間のまとめ、recap)、`informational` (お知らせ)、`plan_mode` などは Claude Code の画面に出るが、`wtr` の 3 つの行 (道具の呼び出し、指示、要約の区切り) に当たらないので捨てる
 - 知らない種類も画面には出さない (数えるだけ)
+- 会話の巻き戻し (esc 2 回など): 取り消した分の記録は jsonl に残り、新しいプロンプトが戻った先の記録を `parentUuid` にして追記される。作業履歴には今の会話の枝だけを出す (Claude Code の画面と同じ見え方。2026-11-26 の判断、Issue #7)
+  - 1 つの記録の子に user のプロンプト (指示の行になる記録。`isMeta`、`isCompactSummary`、`tool_result` だけの記録は入れない) が 2 つ以上並ぶ所だけを巻き戻しとみなす。ファイルで後に出たプロンプトを残し、ほかのプロンプトとその下の記録 (`parentUuid` でたどれる子孫) を隠す
+  - 並列の tool 呼び出しでも子は分かれる (tool_use の子に、次の tool_use と自分の tool_result が並ぶ)。これは巻き戻しではないので触れない。最後の記録から `parentUuid` をたどるだけにしないのは、この tool_result が消えるため
+  - `compact_boundary` は `parentUuid` が null で、`logicalParentUuid` が前の記録を指す。親を `logicalParentUuid` でつなぎ、compact より前の行も出す
+  - 追記の途中で枝が変わったときは、行を作り直す。選んでいた行が隠れたら (または一番下に追従していたら)、一番下に移って追従する。隠れていない行を選んでいたら、そのまま
 - 知らない種類を Issue にする仕組み (段階 2 で作る):
   - `wtr scan-records [PATH]...`: 引数が無ければ `~/.claude/projects` の jsonl を読み、知らない種類ごとに、件数、初めて現れた `version`、出てきた欄の名前 (キーだけ) を 1 行の JSON で標準出力に出す。既に知っている種類で、使っている欄 (`toolUseResult.structuredPatch`、`compactMetadata.preTokens` など) が無くなったことも出す。`wtr` は結果を出すだけで、gh は呼ばない (設計者の判断。gh の有無や認証、重複の確かめを `wtr` に持たせないため)。出力の JSON の形 (dotfiles との約束):
     ```json

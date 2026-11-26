@@ -19,7 +19,13 @@ pub struct Conversation {
     records: Vec<Value>,
     /// Every main-chain uuid in file order, with its parent.
     order: Vec<(String, Option<String>)>,
-    /// Per parent uuid, its latest prompt child.
+    /// Parent of every main-chain uuid.
+    parents: HashMap<String, Option<String>>,
+    /// `system` and `attachment` records: a prompt may hang off one of these
+    /// written after the one the abandoned prompt hangs off (a recap, an
+    /// `away_summary`), so they are skipped when finding where prompts fork.
+    passthrough: HashSet<String>,
+    /// Per fork point (see `fork_point`), its latest prompt.
     last_prompt: HashMap<String, String>,
     /// Prompts a rewind abandoned.
     abandoned: HashSet<String>,
@@ -48,7 +54,7 @@ impl Conversation {
                 .map(str::to_string);
             if let Some(p) = &parent
                 && is_prompt_record(rec)
-                && let Some(old) = self.last_prompt.insert(p.clone(), u.clone())
+                && let Some(old) = self.last_prompt.insert(self.fork_point(p), u.clone())
                 && &old != u
             {
                 self.abandoned.insert(old);
@@ -59,6 +65,13 @@ impl Conversation {
             {
                 self.hidden.insert(u.clone());
             }
+            if matches!(
+                rec.get("type").and_then(Value::as_str),
+                Some("system" | "attachment")
+            ) {
+                self.passthrough.insert(u.clone());
+            }
+            self.parents.insert(u.clone(), parent.clone());
             self.order.push((u.clone(), parent));
         }
         if classify(&record_kind(rec)) == Class::Use {
@@ -71,6 +84,24 @@ impl Conversation {
             self.history.push(rec);
         }
         None
+    }
+
+    /// Where a prompt under `parent` forks from others: the nearest ancestor
+    /// (from `parent` up) that is not a `system` / `attachment` record, or the
+    /// topmost one when the chain reaches the start of the session.
+    fn fork_point(&self, parent: &str) -> String {
+        let mut at = parent;
+        // Bounded, so a parent loop in a broken file cannot hang.
+        for _ in 0..=self.order.len() {
+            if !self.passthrough.contains(at) {
+                break;
+            }
+            match self.parents.get(at) {
+                Some(Some(up)) => at = up,
+                _ => break,
+            }
+        }
+        at.to_string()
     }
 
     /// Recomputes what is hidden and rebuilds the rows; returns how many
@@ -257,6 +288,54 @@ mod tests {
         );
         assert_eq!(prompts(&c), ["first", "new"]);
         assert!(!c.history.rows.iter().any(|r| matches!(r, Row::Compact(_))));
+    }
+
+    fn system(uuid: &str, parent: &str, subtype: &str) -> Value {
+        json!({"type": "system", "subtype": subtype, "uuid": uuid, "parentUuid": parent})
+    }
+
+    #[test]
+    fn a_rewind_through_a_recap_is_still_a_rewind() {
+        // From a real session (2026-11-26): the old prompt hangs off the
+        // turn_duration record, the new one off a recap (away_summary) that
+        // was written under the same turn_duration record.
+        let mut c = Conversation::new();
+        push_all(
+            &mut c,
+            &[
+                prompt("p0", None, "earlier"),
+                tool_use("a0", "p0", "t0"),
+                system("td", "a0", "turn_duration"),
+                prompt("old", Some("td"), "test"),
+                tool_use("a1", "old", "t1"),
+                system("recap", "td", "away_summary"),
+            ],
+        );
+        assert_eq!(prompts(&c), ["earlier", "test"]);
+        let kept = c.push(&prompt("new", Some("recap"), "test again"));
+        assert_eq!(prompts(&c), ["earlier", "test again"]);
+        assert_eq!(tools(&c), ["t0"]);
+        assert!(kept.is_some());
+    }
+
+    #[test]
+    fn a_prompt_after_a_recap_on_the_same_branch_is_not_a_rewind() {
+        let mut c = Conversation::new();
+        let kept = push_all(
+            &mut c,
+            &[
+                prompt("p1", None, "one"),
+                tool_use("a1", "p1", "t1"),
+                system("td", "a1", "turn_duration"),
+                system("recap", "td", "away_summary"),
+                prompt("p2", Some("recap"), "two"),
+                tool_use("a2", "p2", "t2"),
+                system("td2", "a2", "turn_duration"),
+                prompt("p3", Some("td2"), "three"),
+            ],
+        );
+        assert_eq!(kept, None);
+        assert_eq!(prompts(&c), ["one", "two", "three"]);
     }
 
     #[test]
